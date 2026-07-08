@@ -771,7 +771,6 @@ def build_override_yaml(decision: ScanDecision,
     --platform-analysis is passed.
     """
     parts = [
-        "# Managed by script.py - do not edit by hand.",
         f"# Detection: SAST={decision.sast} ({decision.reasons['sast']})",
         f"#            SCA={decision.sca} ({decision.reasons['sca']})",
         f"#            IaC={decision.iac} ({decision.reasons['iac']})",
