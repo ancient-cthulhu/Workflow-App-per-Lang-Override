@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, asdict
+from urllib.parse import quote
 
 log = logging.getLogger("veracode-provision")
 
@@ -111,16 +112,16 @@ DEFAULT_MATRICES: dict = {
     # Manifests / lockfiles the SCA agent can resolve, per package manager rows
     # in the agent support table. Exact lowercase basenames.
     "SCA_MANIFEST_NAMES": [
-        # Java/Kotlin/Scala: Maven, Gradle, Ant/Ivy, SBT
+        # Java/Kotlin/Scala: Maven, Gradle, Ant/Ivy, SBT (+ wrappers, catalogs)
         "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
         "settings.gradle.kts", "gradle.lockfile", "build.sbt", "ivy.xml",
-        "build.xml",
+        "build.xml", "gradlew", "mvnw", "libs.versions.toml",
         # JavaScript/TypeScript: NPM, Yarn, Bower
         "package.json", "package-lock.json", "npm-shrinkwrap.json",
         "yarn.lock", "bower.json",
-        # Python: pip, Pipenv, Poetry
+        # Python: pip, Pipenv, Poetry (requirements*.txt also matched by rule)
         "requirements.txt", "pipfile", "pipfile.lock", "pyproject.toml",
-        "setup.py", "poetry.lock",
+        "setup.py", "setup.cfg", "poetry.lock",
         # Go: Go modules, Dep, Glide, GoDep, GoVendor, Trash, go get
         "go.mod", "go.sum", "gopkg.toml", "gopkg.lock",
         "glide.yaml", "glide.lock", "trash.lock", "vendor.json",
@@ -129,8 +130,9 @@ DEFAULT_MATRICES: dict = {
         "composer.json", "composer.lock",
         # Ruby: Bundler
         "gemfile", "gemfile.lock", "gems.rb",
-        # .NET: NuGet
-        "packages.config", "project.json",
+        # .NET: NuGet (+ central package management)
+        "packages.config", "project.json", "directory.build.props",
+        "directory.packages.props", "global.json",
         # Objective-C/Swift: CocoaPods (Carthage is NOT agent-supported)
         "podfile", "podfile.lock",
         # C/C++: Make
@@ -138,8 +140,9 @@ DEFAULT_MATRICES: dict = {
     ],
     # Manifest suffixes (lowercase). .jar/.dll covered by the agent's
     # "Jars"/"DLL" hash-based quick scan rows, so vendored-binary repos count.
+    # .sbt covers plugins.sbt and other sbt build definitions.
     "SCA_MANIFEST_SUFFIXES": [".csproj", ".fsproj", ".vbproj", ".sln",
-                              ".nuspec", ".jar", ".dll"],
+                              ".nuspec", ".jar", ".dll", ".sbt"],
     # IaC / container / secrets scan signals. Exact lowercase basenames.
     "IAC_FILE_NAMES": [
         "dockerfile", "containerfile", ".dockerignore",
@@ -188,7 +191,8 @@ DEFAULT_MATRICES: dict = {
     # .fsproj when weak signals exist (automatic) or --deep-dotnet is passed:
     "WINDOWS_FILE_NAMES": ["packages.config", "global.asax"],
     "WINDOWS_FILE_SUFFIXES": [".vcxproj", ".vcproj", ".aspx", ".ascx",
-                              ".asax", ".master", ".asmx"],
+                              ".asax", ".master", ".asmx", ".sqlproj",
+                              ".wixproj"],
     "WINDOWS_WEAK_FILE_NAMES": ["app.xaml", "web.config"],
     "WINDOWS_WEAK_FILE_SUFFIXES": [".xaml", ".vbproj", ".fsproj"],
     "WINDOWS_PROJECT_MARKERS": [
@@ -202,6 +206,64 @@ DEFAULT_MATRICES: dict = {
         "<targetframework>net4",             # SDK-style targeting Framework
         "<targetframeworks>net4",
     ],
+    # Path segments treated as vendored/generated content and EXCLUDED from
+    # extension-language detection, SCA manifest detection, IaC artifact
+    # detection, and Windows signal detection. Rationale: committed
+    # node_modules or build output must not classify a repo's language, and a
+    # packages.config buried in a vendored dependency must not force a
+    # Windows runner. The GitHub Linguist API already excludes vendored paths;
+    # this makes the extension fallback consistent with it. NOT excluded:
+    # 'packages' (legit JS monorepo layout), 'lib', 'src'.
+    "VENDORED_PATH_SEGMENTS": [
+        "node_modules", "bower_components", "jspm_packages",
+        "vendor", "vendors", "third_party", "third-party", "external", "externals",
+        "dist", "build", "out", "output", "target",
+        "bin", "obj",
+        ".venv", "venv", "env", "__pycache__", "site-packages", ".tox", ".eggs",
+        "pods", "carthage", "deriveddata",
+        ".terraform", ".gradle", ".mvn", ".idea", ".vscode",
+        "coverage", ".nyc_output",
+    ],
+    # Suffixes of generated/minified files excluded from extension-language
+    # detection (a repo whose only JS is bundled output is not a JS project).
+    "GENERATED_FILE_SUFFIXES": [".min.js", ".bundle.js", ".chunk.js",
+                                ".min.mjs", ".pb.go", "_pb2.py", ".g.cs",
+                                ".designer.cs", ".generated.cs"],
+    # Build-tool configuration files excluded from extension-language
+    # detection. A repo whose only .js/.ts files are these is not a
+    # JavaScript project (docs sites, Python repos with frontend tooling).
+    # They do NOT affect SCA manifest detection: if package.json exists, the
+    # repo has an npm dependency tree worth scanning regardless.
+    "TOOLING_CONFIG_BASENAMES": [
+        "webpack.config.js", "webpack.mix.js", "babel.config.js",
+        "babel.config.cjs", "jest.config.js", "jest.config.ts",
+        "jest.setup.js", "rollup.config.js", "rollup.config.mjs",
+        "vite.config.js", "vite.config.ts", "vitest.config.ts",
+        "tailwind.config.js", "tailwind.config.ts", "postcss.config.js",
+        "next.config.js", "next.config.mjs", "nuxt.config.js",
+        "nuxt.config.ts", "metro.config.js", "svelte.config.js",
+        "playwright.config.ts", "playwright.config.js",
+        "cypress.config.js", "cypress.config.ts", "protractor.conf.js",
+        "karma.conf.js", "gulpfile.js", "gruntfile.js",
+        "prettier.config.js", ".eslintrc.js", ".eslintrc.cjs",
+        "eslint.config.js", "eslint.config.mjs",
+        "commitlint.config.js", "stylelint.config.js", "tsup.config.ts",
+    ],
+    # Minimum byte count for a Linguist API language to count toward scan
+    # enablement (filters trivial stubs; the language is still reported).
+    "MIN_LANGUAGE_BYTES": 200,
+    # Ambiguous extensions require corroborating files before they count:
+    #   .m   - Objective-C vs MATLAB/Mercury; needs Apple project evidence
+    #   .cls - Apex vs LaTeX document class vs VB6; needs Salesforce evidence
+    # (The Linguist API disambiguates these itself and is trusted as-is;
+    # corroboration applies only to the extension fallback.)
+    "APPLE_CORROBORATION_NAMES": ["podfile", "podfile.lock", "info.plist",
+                                  "cartfile", "package.swift"],
+    "APPLE_CORROBORATION_SUFFIXES": [".pbxproj", ".xcworkspacedata",
+                                     ".xcscheme", ".swift", ".xcconfig"],
+    "SALESFORCE_CORROBORATION_NAMES": ["sfdx-project.json"],
+    "SALESFORCE_CORROBORATION_SEGMENTS": ["force-app", "classes", "triggers",
+                                          "aura", "lwc"],
 }
 
 SECTION_KEYS = {
@@ -366,7 +428,7 @@ def fetch_languages(gh: GhClient, org: str, repo: str) -> dict[str, int]:
 
 def fetch_tree(gh: GhClient, org: str, repo: str, branch: str,
                recursive: bool = True) -> tuple[list[dict], bool]:
-    url = f"repos/{org}/{repo}/git/trees/{branch}"
+    url = f"repos/{org}/{repo}/git/trees/{quote(branch, safe='')}"
     if recursive:
         url += "?recursive=1"
     data = gh.json(["api", url], ok_statuses=(404, 409))  # 409 = empty repo
@@ -382,13 +444,15 @@ def inspect_repo(gh: GhClient, org: str, repo: dict) -> RepoInfo:
     info = RepoInfo(name=name, default_branch=branch)
     info.languages = fetch_languages(gh, org, name)
 
-    entries, truncated = fetch_tree(gh, org, name, branch, recursive=True)
+    # HEAD always resolves the default branch regardless of branch naming
+    # (slashes, unicode), unlike passing the branch name as a tree ref.
+    entries, truncated = fetch_tree(gh, org, name, "HEAD", recursive=True)
     info.tree_truncated = truncated
     if truncated:
         # Recursive listing was cut off. Root-level files (where manifests and
         # most IaC entry points live) may be missing, so merge in a guaranteed
         # non-recursive root listing.
-        root_entries, _ = fetch_tree(gh, org, name, branch, recursive=False)
+        root_entries, _ = fetch_tree(gh, org, name, "HEAD", recursive=False)
         seen = {e.get("path") for e in entries}
         entries += [e for e in root_entries if e.get("path") not in seen]
         log.warning("[%s] git tree truncated by API. Detection is best-effort; "
@@ -409,7 +473,7 @@ def deep_iac_confirm(gh: GhClient, org: str, repo: str, branch: str,
     hits = []
     markers = ("awstemplateformatversion", "apiversion:", "kind:")
     for path in candidates[:max_files]:
-        data = gh.json(["api", f"repos/{org}/{repo}/contents/{path}?ref={branch}"],
+        data = gh.json(["api", f"repos/{org}/{repo}/contents/{quote(path)}?ref={quote(branch, safe='')}"],
                        ok_statuses=(404,))
         if not isinstance(data, dict) or data.get("encoding") != "base64":
             continue
@@ -425,11 +489,15 @@ def deep_iac_confirm(gh: GhClient, org: str, repo: str, branch: str,
 
 def scan_windows_signals(paths: list[str], mx: Matrices) -> tuple[set, set, list]:
     """Return (strong_hits, weak_hits, project_files) for Windows runner
-    detection. project_files are .csproj/.vbproj/.fsproj paths sorted
-    shallowest-first, the candidates for content inspection."""
+    detection, ignoring vendored/generated paths (a packages.config inside a
+    committed dependency must not force a Windows runner). project_files are
+    .csproj/.vbproj/.fsproj paths sorted shallowest-first, the candidates for
+    content inspection."""
     strong, weak, projects = set(), set(), []
     for p in paths:
         lp = p.lower()
+        if not is_scannable_path(lp, mx):
+            continue
         base = lp.rsplit("/", 1)[-1]
         if base in mx.windows_file_names or base.endswith(mx.windows_file_suffixes):
             strong.add(base)
@@ -451,7 +519,7 @@ def deep_dotnet_check(gh: GhClient, org: str, repo: str, branch: str,
     Project files that fail to download or decode are skipped without
     concluding anything from them."""
     for path in project_paths[:max_files]:
-        data = gh.json(["api", f"repos/{org}/{repo}/contents/{path}?ref={branch}"],
+        data = gh.json(["api", f"repos/{org}/{repo}/contents/{quote(path)}?ref={quote(branch, safe='')}"],
                        ok_statuses=(404,))
         if not isinstance(data, dict) or data.get("encoding") != "base64":
             continue
@@ -497,29 +565,87 @@ class Matrices:
             s.lower() for s in m.get("WINDOWS_WEAK_FILE_SUFFIXES", []))
         self.windows_project_markers = tuple(
             s.lower() for s in m.get("WINDOWS_PROJECT_MARKERS", []))
+        self.vendored_segments = {s.lower() for s in m.get("VENDORED_PATH_SEGMENTS", [])}
+        self.generated_suffixes = tuple(
+            s.lower() for s in m.get("GENERATED_FILE_SUFFIXES", []))
+        self.tooling_config_basenames = {
+            n.lower() for n in m.get("TOOLING_CONFIG_BASENAMES", [])}
+        self.min_language_bytes = int(m.get("MIN_LANGUAGE_BYTES", 0))
+        self.apple_corr_names = {n.lower() for n in m.get("APPLE_CORROBORATION_NAMES", [])}
+        self.apple_corr_suffixes = tuple(
+            s.lower() for s in m.get("APPLE_CORROBORATION_SUFFIXES", []))
+        self.sf_corr_names = {n.lower() for n in m.get("SALESFORCE_CORROBORATION_NAMES", [])}
+        self.sf_corr_segments = {s.lower() for s in m.get("SALESFORCE_CORROBORATION_SEGMENTS", [])}
+
+
+def is_scannable_path(lower_path: str, mx: Matrices) -> bool:
+    """False for vendored/generated content that must not classify a repo:
+    committed node_modules, build output, virtualenvs, minified bundles."""
+    if lower_path.endswith(mx.generated_suffixes):
+        return False
+    for seg in lower_path.split("/")[:-1]:  # directory segments only
+        if seg in mx.vendored_segments:
+            return False
+    return True
+
+
+def filtered_entries(paths: list[str], mx: Matrices) -> list[tuple[str, str]]:
+    """(lower_path, lower_basename) tuples for non-vendored paths."""
+    out = []
+    for p in paths:
+        lp = p.lower()
+        if is_scannable_path(lp, mx):
+            out.append((lp, lp.rsplit("/", 1)[-1]))
+    return out
 
 
 def languages_from_extensions(entries: list[tuple[str, str]], mx: Matrices) -> set[str]:
+    """Language detection fallback from file extensions, with two safeguards
+    the Linguist API applies natively: tooling configs do not classify a repo
+    (a Python repo with webpack.config.js is not a JavaScript project), and
+    ambiguous extensions require corroboration (.m is MATLAB as often as
+    Objective-C, .cls is a LaTeX class as often as Apex; enabling SAST on the
+    wrong guess produces a failing, PR-blocking scan)."""
+    apple_ok = any(
+        base in mx.apple_corr_names or lp.endswith(mx.apple_corr_suffixes)
+        for lp, base in entries)
+    sf_ok = any(
+        base in mx.sf_corr_names
+        or any(seg in mx.sf_corr_segments for seg in lp.split("/")[:-1])
+        for lp, base in entries)
+
     found = set()
-    for lp, _ in entries:
-        dot = lp.rfind(".")
+    for lp, base in entries:
+        if base in mx.tooling_config_basenames:
+            continue
+        dot = base.rfind(".")
         if dot == -1:
             continue
-        lang = mx.code_extensions.get(lp[dot:])
-        if lang:
-            found.add(lang)
+        ext = base[dot:]
+        lang = mx.code_extensions.get(ext)
+        if not lang:
+            continue
+        if ext == ".m" and not apple_ok:
+            continue
+        if ext in (".cls", ".trigger") and not sf_ok:
+            continue
+        found.add(lang)
     return found
 
 
 def decide(info: RepoInfo, mx: Matrices,
            deep_iac_hits: list[str] | None = None,
            deep_dotnet_hit: str | None = None) -> ScanDecision:
-    langs = set(info.languages.keys())
-    entries = [(p.lower(), p.lower().rsplit("/", 1)[-1]) for p in info.paths]
-    # Union of Linguist API results and extension scan: catches repos where the
-    # languages API returns nothing, misclassifies, or lags behind pushes.
+    # Linguist languages below the byte threshold do not enable scans (a
+    # 40-byte stub should not classify a repo); union with the extension scan
+    # to catch empty/lagging API responses. Vendored and generated paths are
+    # excluded from all file-based detection.
+    langs = {l for l, b in info.languages.items()
+             if b >= mx.min_language_bytes}
+    entries = filtered_entries(info.paths, mx)
     ext_langs = languages_from_extensions(entries, mx)
     all_langs = langs | ext_langs
+    has_submodules = any(p == ".gitmodules" for p in info.paths)
 
     # --- SAST (pipeline scan) ---
     sast_langs = all_langs & mx.sast_languages
@@ -529,6 +655,9 @@ def decide(info: RepoInfo, mx: Matrices,
     manifests = set()
     for _, base in entries:
         if base in mx.sca_manifest_names or base.endswith(mx.sca_manifest_suffixes):
+            manifests.add(base)
+        elif "requirements" in base and base.endswith(".txt"):
+            # requirements-dev.txt, dev-requirements.txt, requirements_test.txt
             manifests.add(base)
     sca_langs = all_langs & mx.sca_languages
     # Require a supported ecosystem AND a resolvable manifest. An SCA agent run
@@ -570,6 +699,9 @@ def decide(info: RepoInfo, mx: Matrices,
                        f"{sorted(all_langs & mx.sast_compiled_only)}")
     else:
         sast_reason = f"no supported language (found: {sorted(all_langs)[:8]})"
+        if has_submodules:
+            sast_reason += ("; .gitmodules present, code may live in "
+                            "submodules the integration cannot see")
 
     # --- Runner (default: runs_on) ---
     # Central default runner is ubuntu-latest. Windows is set only when a
@@ -639,6 +771,7 @@ def build_override_yaml(decision: ScanDecision,
     --platform-analysis is passed.
     """
     parts = [
+        "# Managed by script.py - do not edit by hand.",
         f"# Detection: SAST={decision.sast} ({decision.reasons['sast']})",
         f"#            SCA={decision.sca} ({decision.reasons['sca']})",
         f"#            IaC={decision.iac} ({decision.reasons['iac']})",
@@ -670,12 +803,12 @@ def git_blob_sha(content: str) -> str:
 # ---------------------------------------------------------------------------
 
 def create_branch(gh: GhClient, org: str, repo: str, base: str, new: str) -> bool:
-    head = gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{base}"],
+    head = gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{quote(base, safe='')}"],
                    ok_statuses=(404,))
     if not head:
         log.error("[%s] cannot resolve head of %s", repo, base)
         return False
-    if gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{new}"], ok_statuses=(404,)):
+    if gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{quote(new, safe='')}"], ok_statuses=(404,)):
         log.info("[%s] branch %s already exists, reusing", repo, new)
         return True
     gh.run(["api", "-X", "POST", f"repos/{org}/{repo}/git/refs",
@@ -684,7 +817,7 @@ def create_branch(gh: GhClient, org: str, repo: str, base: str, new: str) -> boo
 
 
 def get_file_sha_on_ref(gh: GhClient, org: str, repo: str, ref: str) -> str | None:
-    data = gh.json(["api", f"repos/{org}/{repo}/contents/veracode.yml?ref={ref}"],
+    data = gh.json(["api", f"repos/{org}/{repo}/contents/veracode.yml?ref={quote(ref, safe='')}"],
                    ok_statuses=(404,))
     return data.get("sha") if isinstance(data, dict) else None
 
