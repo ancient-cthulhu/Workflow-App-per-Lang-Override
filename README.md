@@ -1,6 +1,6 @@
 # Workflow App per Language Scan/Runner Scoping for GitHub
 
-Provisions per-repository `veracode.yml` override files across a GitHub organization for the [Veracode GitHub Workflow Integration](https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning) . Detects each repo's languages, dependency manifests, and IaC artifacts, then disables the scan triggers that do not apply, so an IaC repo does not fail SAST, a docs repo does not fail SCA, and gating on scan results does not block PRs.
+Provisions per-repository `veracode.yml` override files across a GitHub organization for the [Veracode GitHub Workflow Integration](https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning). Detects each repo's languages, dependency manifests, and IaC artifacts, then disables the scan triggers that do not apply, so an IaC repo does not fail SAST, a docs repo does not fail SCA, and gating on scan results does not block PRs.
 
 -----
 
@@ -9,12 +9,12 @@ Provisions per-repository `veracode.yml` override files across a GitHub organiza
 For each repository the script:
 
 1. Reads languages (GitHub Linguist API) and the full file tree via the GitHub CLI
-1. Decides, per scan type, whether it is relevant:
-   - **SAST** - language must be one the workflow integration's autopackager actually builds
+2. Decides, per scan type, whether it is relevant:
+   - **SAST** - language must be one the workflow integration can build
    - **SCA** - ecosystem must be agent-supported *and* a resolvable manifest/lockfile must exist
-   - **IaC/secrets** - Terraform, Dockerfiles, Helm/K8s manifests, and related artifacts
-1. Writes a minimal `veracode.yml` at the repo root disabling only the irrelevant scans' `push`/`pull_request` triggers. Repos where all three scans are relevant get no file at all.
-1. Opens a PR with the change (or commits directly with `--direct-commit`)
+   - **IaC/secrets** - Terraform, Dockerfiles, Helm/K8s manifests, and related artifacts (or secret detection everywhere)
+3. Writes a minimal `veracode.yml` at the repo root disabling only the irrelevant scans' `push`/`pull_request` triggers. Repos where all three scans are relevant get no file at all.
+4. Opens a PR with the change (or commits directly with `--direct-commit`)
 
 All operations are idempotent. If the generated file is byte-identical to what already exists in the repo (compared via git blob SHA, computed locally with no extra API call), the repo is skipped.
 
@@ -26,7 +26,7 @@ All operations are idempotent. If the generated file is byte-identical to what a
 
 **SAST policy: pipeline-first.** Static scans stay enabled for every Pipeline Scan supported language (.NET, Java, JS/TS, Kotlin, Python, Go, Ruby, Scala, PHP, Apex, ColdFusion, Apple platforms, C/C++, COBOL, Groovy, and the mobile/hybrid frameworks). The autopackager's supported list grows over time, so repos are deliberately not opted out based on what is autopackageable today. Only languages with no pipeline support at all (Perl, PL/SQL, T-SQL, Classic ASP, RPG, VB6, Dart - platform Upload and Scan only) disable static. If packaging failures do become PR-blocking for a specific ecosystem in your org, two empty config tiers (`SAST_PIPELINE_NOT_AUTOPACKAGED`, `SAST_COMPILED_ONLY`) let you move languages out per client via `--config`, with the reason recorded in the file header, PR body, and report.
 
-**SCA policy.** Follows the integration table's SCA column: .NET, Go, Java, JavaScript/TypeScript, Kotlin, PHP, Python, Scala, always paired with a resolvable manifest/lockfile. Ruby, Android, and React Native have no SCA support in the integration (React Native repos still match via JavaScript).
+**SCA policy.** Follows the integration's SCA support: .NET, Go, Java, JavaScript/TypeScript, Kotlin, PHP, Python, Scala, always paired with a resolvable manifest/lockfile. Ruby, Android, and React Native have no SCA support in the integration (React Native repos still match via JavaScript). Manifest detection is comprehensive: standard lockfiles, build wrappers (`gradlew`, `mvnw`), Gradle catalogs, .NET central package management, `setup.cfg`, `requirements*.txt` variants, `.sbt` files, and vendored `.jar`/`.dll` hash scanning.
 
 **IaC/secrets policy: secrets-first.** The IaC/secrets scan is enabled by default for every repo, including those with no IaC artifacts. The scan does two things: it scans container and infrastructure manifests (Terraform, Dockerfiles, Helm/K8s, CloudFormation) when present, and it detects hardcoded secrets in all repo contents. Since secret detection is universally valuable and the scan rarely fails, repos are not opted out based on detected artifact presence. Pass `--no-iac` to disable it org-wide (rare). The presence of IaC artifacts is noted in the reasons logged and reported, but does not change the default on.
 
@@ -43,11 +43,29 @@ Detection is tiered to avoid both false positives (a MAUI app forced onto Window
 
 | Tier | Signals | Effect |
 |---|---|---|
-| Strong | `packages.config`, `Global.asax`, `*.aspx`/`*.ascx`/`*.asax`/`*.master`/`*.asmx` (WebForms), `*.vcxproj`/`*.vcproj` (MSVC) | Windows, directly. These artifacts have no portable counterpart. |
+| Strong | `packages.config`, `Global.asax`, `*.aspx`/`*.ascx`/`*.asax`/`*.master`/`*.asmx` (WebForms), `*.vcxproj`/`*.vcproj` (MSVC), `.sqlproj`, `.wixproj` | Windows, directly. These artifacts have no portable counterpart. |
 | Weak | `*.xaml`, `web.config`, `*.vbproj`, `*.fsproj` | Never force Windows alone. Each has a Linux-buildable counterpart (MAUI/Avalonia XAML, ASP.NET Core IIS configs, SDK-style VB/F#). They automatically trigger project-file inspection. |
 | Project markers | Inside `.csproj`/`.vbproj`/`.fsproj` contents: `<TargetFrameworkVersion>`, `ToolsVersion`, the msbuild/2003 xmlns (old-style projects), `<UseWPF>`, `<UseWindowsForms>`, `net4x` and `*-windows` target frameworks | Windows when found. Inspection runs automatically for weak-signal repos (up to 5 files, shallowest first, 1 API call each). |
 
 Plain `.cs`, `.csproj`, and `.sln` are deliberately not signals: SDK-style .NET builds on the default Linux runner. `--deep-dotnet` extends project-file inspection to every repo containing project files, catching the zero-surface-signal case of an SDK-style project targeting `net48` or `net8.0-windows`. `--runner off` disables the feature entirely. On truncated trees the runner reason is annotated as best-effort. All three signal tiers are `--config` keys (`WINDOWS_FILE_NAMES`, `WINDOWS_FILE_SUFFIXES`, `WINDOWS_WEAK_FILE_NAMES`, `WINDOWS_WEAK_FILE_SUFFIXES`, `WINDOWS_PROJECT_MARKERS`), so org-specific conventions can be added without code changes. The runner decision and its reasoning appear in the generated file header, the PR body, the per-repo log line, and the `--report` JSON.
+
+-----
+
+## Detection Robustness
+
+Detection is hardened against the repo patterns that produce wrong decisions in the wild. Every safeguard below is active by default and tunable via `--config`.
+
+**Vendored and generated content is invisible to detection.** Committed `node_modules/`, `vendor/`, `bower_components/`, build output (`dist/`, `build/`, `target/`, `bin/`, `obj/`, `out/`), virtualenvs, `Pods/`, `.terraform/`, coverage output, minified bundles (`*.min.js`, `*.bundle.js`), and generated sources (`*.pb.go`, `*_pb2.py`, `*.designer.cs`) are excluded from language, manifest, IaC, and Windows-signal scanning (`VENDORED_PATH_SEGMENTS`, `GENERATED_FILE_SUFFIXES`). A Terraform repo with a committed `node_modules` is not a JavaScript project, a `packages.config` buried inside a vendored dependency does not force a Windows runner, and a `target/*.jar` build artifact does not enable SCA. This mirrors what the GitHub Linguist API already does natively, making the extension fallback consistent with it. `packages/` is deliberately not excluded (legitimate JS monorepo layout), and Go repos with `vendor/` are still fully detected via their root `go.mod`.
+
+**Build-tool configs do not classify a repo.** A Python or docs repo whose only `.js`/`.ts` files are `webpack.config.js`, `jest.config.ts`, `tailwind.config.js`, and the rest of the tooling zoo (~35 entries in `TOOLING_CONFIG_BASENAMES`) is not treated as a JavaScript project. If a real `package.json` exists, SCA still triggers, correctly, since there is an npm dependency tree worth scanning.
+
+**Ambiguous extensions require corroboration.** `.m` is MATLAB or Mercury as often as Objective-C, and `.cls` is a LaTeX document class or VB6 as often as Apex. Guessing wrong enables a SAST scan that fails and blocks PRs. `.m` only counts with Apple project evidence (Podfile, `.pbxproj`, `.swift`, `Info.plist`, `.xcconfig`); `.cls`/`.trigger` only count with Salesforce evidence (`sfdx-project.json`, `force-app/`, `classes/` directories). The Linguist API disambiguates these itself and is trusted as-is; corroboration applies only to the extension fallback.
+
+**Trivial stubs do not enable scans.** Linguist languages below `MIN_LANGUAGE_BYTES` (default 200) are ignored for scan enablement, so a 40-byte hello-world stub does not classify a repo. The union of the Linguist API and the extension fallback still catches repos where the API returns nothing or lags behind pushes.
+
+**Structural resilience.** Default-branch trees are fetched via `HEAD`, immune to branch names with slashes or unicode; file paths and refs in API calls are URL-encoded. Truncated trees on huge repos merge in a non-recursive root listing and keep scans enabled rather than guessing them off, with the truncation noted in every affected reason. Submodule-only repos (`.gitmodules` with no visible code) get the explanation recorded in the SAST reason instead of a silent disable. Repos that are empty, archived, disabled, or forks are filtered before any API spend.
+
+**Fail-open philosophy.** Every ambiguity resolves toward keeping a scan enabled: SAST is pipeline-first, IaC/secrets is on everywhere, SCA stays on when a truncated tree prevents proving a manifest absent. The overrides this tool writes only remove scans that would fail or scan nothing, never scans that might work.
 
 -----
 
@@ -74,13 +92,13 @@ Plain `.cs`, `.csproj`, and `.sln` are deliberately not signals: SDK-style .NET 
 gh auth login
 
 # Phase 1 - see what would change, review before touching anything
-python3 script.py --org my-org --dry-run --report audit.json
+python3 provision_veracode_yml.py --org my-org --dry-run --report audit.json
 
 # Phase 2 - roll out via PR
-python3 script.py --org my-org
+python3 provision_veracode_yml.py --org my-org
 
 # Phase 3 - pilot on a subset first if preferred
-python3 script.py --org my-org --include 'team-*'
+python3 provision_veracode_yml.py --org my-org --include 'team-*'
 ```
 
 -----
@@ -117,7 +135,7 @@ Empty and disabled repos are always skipped.
 | `--runner {auto,off}` | `auto` | `auto` writes `default: runs_on: windows-latest` on confirmed Windows build signals when a build-based scan is enabled; weak signals auto-trigger project-file inspection; `off` never writes `runs_on` |
 | `--deep-dotnet` | off | Extend project-file inspection to every repo with `.csproj`/`.vbproj`/`.fsproj`, catching SDK-style projects targeting `net4x` or `*-windows` TFMs with no surface signal (extra API calls, up to 5 per repo) |
 | `--platform-analysis {true,false}` | unset | Also pin `analysis_on_platform` for SAST-relevant repos. Left untouched by default. |
-| `--config FILE` | built-in | JSON file overriding any detection matrix (language lists, manifest names, IaC patterns) without editing the script |
+| `--config FILE` | built-in | JSON file overriding any detection matrix (25 keys: language lists, manifest names, IaC patterns, Windows signals, vendored paths, tooling configs, corroboration markers) |
 
 ### Rate Limiting
 
@@ -139,17 +157,19 @@ The script checks `/rate_limit` every 50 calls, sleeps until reset when the budg
 
 ## Overriding Detection Matrices
 
-Pass `--config matrices.json` with any subset of these keys to override the defaults without touching the script:
+Pass `--config matrices.json` with any subset of these 25 keys to override the defaults without touching the script. Example:
 
 ```json
 {
   "SAST_LANGUAGES": ["Java", "Python", "Go", "Kotlin", "Scala", "JavaScript", "TypeScript"],
   "SCA_MANIFEST_NAMES": ["pom.xml", "package.json", "requirements.txt"],
-  "IAC_DIR_HINTS": ["terraform/", "infra/", "k8s/"]
+  "IAC_DIR_HINTS": ["terraform/", "infra/", "k8s/"],
+  "VENDORED_PATH_SEGMENTS": ["node_modules", "vendor", "target"],
+  "TOOLING_CONFIG_BASENAMES": ["webpack.config.js", "jest.config.ts"]
 }
 ```
 
-Unknown keys are rejected at startup with the list of valid keys. Use this to, for example, enable SAST for PHP or .NET repos that run a custom scan workflow instead of the integration's autopackager.
+Unknown keys are rejected at startup with the list of valid keys. Use this to customize detection for your org's conventions: enable SAST for languages with custom workflows, adjust manifest patterns, tune runner signals, exclude additional vendored paths, or add tooling configs that shouldn't classify a repo.
 
 -----
 
@@ -218,20 +238,19 @@ Total GitHub API calls: 187
       "languages": {"Java": 128000},
       "tree_truncated": false,
       "decision": {
-        "sast": true, "sca": true, "iac": false,
-        "reasons": {"sast": "languages=['Java']", "sca": "manifests=['pom.xml'], ecosystems=['Java']", "iac": "no IaC/container artifacts"}
+        "sast": true, "sca": true, "iac": true, "runner": null,
+        "reasons": {
+          "sast": "languages=['Java']",
+          "sca": "manifests=['pom.xml'], ecosystems=['Java']",
+          "iac": "artifacts present",
+          "runner": "portable ecosystem, central default (linux)"
+        }
       },
       "override_written": false
     }
   ]
 }
 ```
-
------
-
-## Large Repos and Truncated Trees
-
-GitHub's recursive tree API truncates on very large repos. When this happens the script merges in a guaranteed non-recursive root listing (manifests and most IaC entry points live at root) and defaults SAST/SCA/IaC to **enabled** rather than guessing them off, since a false negative here silently disables a scan while a false positive only costs one avoidable pipeline run.
 
 -----
 
