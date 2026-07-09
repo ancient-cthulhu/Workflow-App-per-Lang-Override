@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import fnmatch
 import hashlib
 import json
@@ -772,7 +773,6 @@ def build_override_yaml(decision: ScanDecision,
     --platform-analysis is passed.
     """
     parts = [
-        "# Managed by script.py - do not edit by hand.",
         f"# Detection: SAST={decision.sast} ({decision.reasons['sast']})",
         f"#            SCA={decision.sca} ({decision.reasons['sca']})",
         f"#            IaC={decision.iac} ({decision.reasons['iac']})",
@@ -862,6 +862,44 @@ def open_pr(gh: GhClient, org: str, repo: str, base: str, head: str,
 # Main
 # ---------------------------------------------------------------------------
 
+def write_csv_report(path: str, report: list[dict]) -> None:
+    """Flatten the per-repo report list into a CSV: one row per repo, scan
+    decisions and reasons as columns, easy to open in Excel/Sheets for
+    client review of a dry run before anything is written to GitHub."""
+    fieldnames = [
+        "repo", "default_branch", "tree_truncated", "outcome",
+        "override_written",
+        "sast", "sast_reason",
+        "sca", "sca_reason",
+        "iac", "iac_reason",
+        "runner", "runner_reason",
+        "languages", "pr_url",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in report:
+            d = r.get("decision", {})
+            reasons = d.get("reasons", {})
+            writer.writerow({
+                "repo": r.get("repo"),
+                "default_branch": r.get("default_branch"),
+                "tree_truncated": r.get("tree_truncated"),
+                "outcome": r.get("outcome"),
+                "override_written": r.get("override_written"),
+                "sast": d.get("sast"),
+                "sast_reason": reasons.get("sast"),
+                "sca": d.get("sca"),
+                "sca_reason": reasons.get("sca"),
+                "iac": d.get("iac"),
+                "iac_reason": reasons.get("iac"),
+                "runner": d.get("runner") or "default",
+                "runner_reason": reasons.get("runner"),
+                "languages": ", ".join(sorted(r.get("languages", {}).keys())),
+                "pr_url": r.get("pr_url", ""),
+            })
+
+
 def matches_any(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(name, p) for p in patterns)
 
@@ -909,6 +947,10 @@ def main() -> int:
                     help="JSON file overriding detection matrices "
                          "(keys: " + ", ".join(sorted(DEFAULT_MATRICES)) + ")")
     ap.add_argument("--report", default=None, help="Write a JSON audit report here")
+    ap.add_argument("--csv", default=None,
+                    help="Write a CSV audit report here. Defaults to "
+                         "'dry_run_report.csv' automatically when --dry-run "
+                         "is set; pass explicitly to also get one on apply runs.")
     ap.add_argument("--min-interval", type=float, default=0.25,
                     help="Minimum seconds between GitHub API calls (default 0.25)")
     ap.add_argument("--min-remaining", type=int, default=100,
@@ -998,30 +1040,36 @@ def main() -> int:
             for k in SECTION_KEYS:
                 log.debug("[%s]   %s: %s", name, k, decision.reasons[k])
 
-            report.append({"repo": name, "default_branch": info.default_branch,
-                           "languages": info.languages,
-                           "tree_truncated": info.tree_truncated,
-                           "decision": asdict(decision),
-                           "override_written": content is not None})
+            report_entry = {"repo": name, "default_branch": info.default_branch,
+                            "languages": info.languages,
+                            "tree_truncated": info.tree_truncated,
+                            "decision": asdict(decision),
+                            "override_written": content is not None,
+                            "outcome": None}
+            report.append(report_entry)
 
             if content is None:
                 summary["no_change"].append(name)
+                report_entry["outcome"] = "no_change"
                 log.info("[%s] all default scans relevant, no override needed", name)
                 continue
 
             if info.existing_veracode_sha:
                 if git_blob_sha(content) == info.existing_veracode_sha:
                     summary["unchanged_identical"].append(name)
+                    report_entry["outcome"] = "already_correct"
                     log.info("[%s] existing veracode.yml already matches, skipping", name)
                     continue
                 if not args.force:
                     summary["skipped"].append(
                         (name, "veracode.yml exists with different content (use --force)"))
+                    report_entry["outcome"] = "skipped_existing_file"
                     continue
 
             if args.dry_run:
                 print(f"\n===== {name} (dry run) =====\n{content}")
                 summary["scoped"].append((name, "dry-run"))
+                report_entry["outcome"] = "would_write"
                 continue
 
             msg = "chore: scope Veracode scans to relevant scan types"
@@ -1029,15 +1077,20 @@ def main() -> int:
                 put_file(gh, args.org, name, info.default_branch, content,
                          info.existing_veracode_sha, msg)
                 summary["scoped"].append((name, f"committed to {info.default_branch}"))
+                report_entry["outcome"] = "committed"
             else:
                 if not create_branch(gh, args.org, name, info.default_branch,
                                      args.branch_name):
-                    summary["failed"].append((name, "branch creation failed")); continue
+                    summary["failed"].append((name, "branch creation failed"))
+                    report_entry["outcome"] = "failed_branch_creation"
+                    continue
                 branch_sha = get_file_sha_on_ref(gh, args.org, name, args.branch_name)
                 put_file(gh, args.org, name, args.branch_name, content, branch_sha, msg)
                 url = open_pr(gh, args.org, name, info.default_branch,
                               args.branch_name, decision)
                 summary["scoped"].append((name, url))
+                report_entry["outcome"] = "pr_opened"
+                report_entry["pr_url"] = url
         except GhError as e:
             log.error("[%s] %s", name, e)
             summary["failed"].append((name, str(e)[:200]))
@@ -1051,6 +1104,11 @@ def main() -> int:
                        time.gmtime()), "api_calls": gh.api_calls,
                        "repos": report}, f, indent=2)
         log.info("Audit report written to %s", args.report)
+
+    csv_path = args.csv or ("dry_run_report.csv" if args.dry_run else None)
+    if csv_path:
+        write_csv_report(csv_path, report)
+        log.info("CSV report written to %s", csv_path)
 
     print("\n========== SUMMARY ==========")
     for key, label in (("scoped", "Scoped (override written/PR)"),
