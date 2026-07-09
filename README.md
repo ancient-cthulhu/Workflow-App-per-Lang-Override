@@ -71,7 +71,8 @@ Detection is hardened against the repo patterns that produce wrong decisions in 
 
 ## Prerequisites
 
-- `GITHUB_TOKEN` environment variable set with the required scopes (see below)
+- `gh` CLI installed and on `PATH` (the script shells out to it for every GitHub API call)
+- `GITHUB_TOKEN` environment variable set with the required scopes (see below) - the `gh` CLI picks this up automatically, so no interactive `gh auth login` is needed
 - Python 3.9+, standard library only, no pip install required
 
 ### GitHub Personal Access Token Setup
@@ -97,7 +98,7 @@ Or pass it inline:
 GITHUB_TOKEN=ghp_... python3 script.py --org my-org
 ```
 
-The script will exit with an error if `GITHUB_TOKEN` is not set.
+The `gh` CLI reads `GITHUB_TOKEN` automatically; nothing further to configure. The script exits with an error before making any API calls if `GITHUB_TOKEN` is not set.
 
 -----
 
@@ -176,6 +177,7 @@ The script checks `/rate_limit` every 50 calls, sleeps until reset when the budg
 | Flag | Default | Description |
 |---|---|---|
 | `--report FILE` | none | Write a JSON audit report: per-repo languages, decisions, reasons, and whether an override was written |
+| `--csv FILE` | `dry_run_report.csv` on `--dry-run`, off otherwise | Write a flat CSV: one row per repo with scan decisions, reasons, runner, languages, and outcome. Auto-generated on every dry run; pass explicitly to also get one on an apply run. |
 | `-v`, `--verbose` | off | Debug-level logging, including the per-scan-type reasoning for every repo |
 
 -----
@@ -205,7 +207,6 @@ Unknown keys are rejected at startup with the list of valid keys. Use this to cu
 Only the disabled sections are written; everything else inherits the central config. Each file carries a comment header with the detection reasoning:
 
 ```yaml
-# Managed by script.py - do not edit by hand.
 # Detection: SAST=True (languages=['C#'])
 #            SCA=True (manifests=['packages.config'], ecosystems=['C#'])
 #            IaC=True (no artifacts detected, kept enabled for secret scanning)
@@ -218,7 +219,6 @@ default:
 And a docs-only repo example (override needed only for SAST and SCA, IaC is on by default):
 
 ```yaml
-# Managed by script.py - do not edit by hand.
 # Detection: SAST=False (no supported language)
 #            SCA=False (no supported manifest/ecosystem pair)
 #            IaC=True (no artifacts detected, kept enabled for secret scanning)
@@ -278,6 +278,17 @@ Total GitHub API calls: 187
   ]
 }
 ```
+
+### `--csv` report
+
+Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv FILE` to name it explicitly, or to also get one on an apply run). One row per repo, flattened for review in Excel/Sheets before anything touches GitHub:
+
+| repo | default_branch | tree_truncated | outcome | override_written | sast | sast_reason | sca | sca_reason | iac | iac_reason | runner | runner_reason | languages | pr_url |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| payments-api | main | False | no_change | False | True | languages=['Java'] | True | manifests=['pom.xml'], ecosystems=['Java'] | True | artifacts present | default | portable ecosystem, central default (linux) | Java | |
+| legacy-billing | main | False | would_write | True | True | languages=['C#'] | True | manifests=['packages.config'] | True | no artifacts detected, kept enabled for secret scanning | windows-latest | windows signals=['packages.config'] | C# | |
+
+`outcome` values: `no_change`, `already_correct`, `would_write` (dry run), `committed`, `pr_opened`, `skipped_existing_file`, `failed_branch_creation`.
 
 -----
 
