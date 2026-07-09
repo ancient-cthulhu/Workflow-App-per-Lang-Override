@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Requirements: gh CLI authenticated (repo + read:org), Python 3.9+, stdlib only.
+Requirements: GITHUB_TOKEN environment variable with scopes repo, workflow, read:org. Python 3.9+, stdlib only.
 
 Usage:
   python3 script.py --org my-org --dry-run --report audit.json
@@ -16,6 +16,7 @@ import fnmatch
 import hashlib
 import json
 import logging
+import os
 import random
 import subprocess
 import sys
@@ -771,6 +772,7 @@ def build_override_yaml(decision: ScanDecision,
     --platform-analysis is passed.
     """
     parts = [
+        "# Managed by script.py - do not edit by hand.",
         f"# Detection: SAST={decision.sast} ({decision.reasons['sast']})",
         f"#            SCA={decision.sca} ({decision.reasons['sca']})",
         f"#            IaC={decision.iac} ({decision.reasons['iac']})",
@@ -916,6 +918,11 @@ def main() -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
+
+    if not os.environ.get("GITHUB_TOKEN"):
+        log.error("GITHUB_TOKEN environment variable not set. Required scopes: "
+                  "repo, workflow, read:org (under admin:org)")
+        return 2
 
     overrides = None
     if args.config:
