@@ -71,8 +71,33 @@ Detection is hardened against the repo patterns that produce wrong decisions in 
 
 ## Prerequisites
 
-- `gh` CLI installed and authenticated (`gh auth login`) with `repo` and `read:org` scope
+- `GITHUB_TOKEN` environment variable set with the required scopes (see below)
 - Python 3.9+, standard library only, no pip install required
+
+### GitHub Personal Access Token Setup
+
+Create a classic Personal Access Token (PAT) with the following scopes:
+
+| Scope | Purpose |
+|---|---|
+| `repo` | Full control of private repositories (needed for reading repo contents and creating/updating files) |
+| `workflow` | Update GitHub Actions workflows (required by the integration scope) |
+| `read:org` | Read organization data (needed for listing repos and reading org settings) |
+
+Export the token as an environment variable before running the script:
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python3 script.py --org my-org --dry-run
+```
+
+Or pass it inline:
+
+```bash
+GITHUB_TOKEN=ghp_... python3 script.py --org my-org
+```
+
+The script will exit with an error if `GITHUB_TOKEN` is not set.
 
 -----
 
@@ -92,13 +117,13 @@ Detection is hardened against the repo patterns that produce wrong decisions in 
 gh auth login
 
 # Phase 1 - see what would change, review before touching anything
-python3 provision_veracode_yml.py --org my-org --dry-run --report audit.json
+python3 script.py --org my-org --dry-run --report audit.json
 
 # Phase 2 - roll out via PR
-python3 provision_veracode_yml.py --org my-org
+python3 script.py --org my-org
 
 # Phase 3 - pilot on a subset first if preferred
-python3 provision_veracode_yml.py --org my-org --include 'team-*'
+python3 script.py --org my-org --include 'team-*'
 ```
 
 -----
@@ -180,6 +205,7 @@ Unknown keys are rejected at startup with the list of valid keys. Use this to cu
 Only the disabled sections are written; everything else inherits the central config. Each file carries a comment header with the detection reasoning:
 
 ```yaml
+# Managed by script.py - do not edit by hand.
 # Detection: SAST=True (languages=['C#'])
 #            SCA=True (manifests=['packages.config'], ecosystems=['C#'])
 #            IaC=True (no artifacts detected, kept enabled for secret scanning)
@@ -192,6 +218,7 @@ default:
 And a docs-only repo example (override needed only for SAST and SCA, IaC is on by default):
 
 ```yaml
+# Managed by script.py - do not edit by hand.
 # Detection: SAST=False (no supported language)
 #            SCA=False (no supported manifest/ecosystem pair)
 #            IaC=True (no artifacts detected, kept enabled for secret scanning)
