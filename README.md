@@ -53,7 +53,7 @@ Plain `.cs`, `.csproj`, and `.sln` are deliberately not signals: SDK-style .NET 
 
 ## Detection Robustness
 
-Detection is hardened against the repo patterns that produce wrong decisions in the wild. Every safeguard below is active by default and tunable via `--config`.
+Every safeguard below is active by default and tunable via `--config`.
 
 **Vendored and generated content is invisible to detection.** Committed `node_modules/`, `vendor/`, `bower_components/`, build output (`dist/`, `build/`, `target/`, `bin/`, `obj/`, `out/`), virtualenvs, `Pods/`, `.terraform/`, coverage output, minified bundles (`*.min.js`, `*.bundle.js`), and generated sources (`*.pb.go`, `*_pb2.py`, `*.designer.cs`) are excluded from language, manifest, IaC, and Windows-signal scanning (`VENDORED_PATH_SEGMENTS`, `GENERATED_FILE_SUFFIXES`). A Terraform repo with a committed `node_modules` is not a JavaScript project, a `packages.config` buried inside a vendored dependency does not force a Windows runner, and a `target/*.jar` build artifact does not enable SCA. This mirrors what the GitHub Linguist API already does natively, making the extension fallback consistent with it. `packages/` is deliberately not excluded (legitimate JS monorepo layout), and Go repos with `vendor/` are still fully detected via their root `go.mod`.
 
@@ -159,9 +159,10 @@ Empty and disabled repos are always skipped.
 | `--no-iac` | off | Disable the IaC/secrets scan for all repos. By default IaC is enabled for secret detection even without IaC artifacts. |
 | `--deep-iac` | off | Download a few ambiguous root YAML/JSON files and check for CloudFormation/Kubernetes markers before confirming IaC relevance (extra API calls) |
 | `--runner {auto,off}` | `auto` | `auto` writes `default: runs_on: windows-latest` on confirmed Windows build signals when a build-based scan is enabled; weak signals auto-trigger project-file inspection; `off` never writes `runs_on` |
-| `--deep-dotnet` | off | Extend project-file inspection to every repo with `.csproj`/`.vbproj`/`.fsproj`, catching SDK-style projects targeting `net4x` or `*-windows` TFMs with no surface signal (extra API calls, up to 5 per repo) |
+| `--deep-dotnet` | off | Extend project-file inspection to every repo with `.csproj`/`.vbproj`/`.fsproj`, catching SDK-style projects targeting `net4x` or `*-windows` TFMs with no surface signal (extra API calls, up to `--max-project-files` per repo) |
+| `--max-project-files N` | `5` | Cap on .NET project files downloaded per repo during Windows-marker inspection. Project files sharing a directory subtree with a weak signal are inspected first; raise the cap for orgs with large multi-project solutions. |
 | `--platform-analysis {true,false}` | unset | Also pin `analysis_on_platform` for SAST-relevant repos. Left untouched by default. |
-| `--config FILE` | built-in | JSON file overriding any detection matrix (25 keys: language lists, manifest names, IaC patterns, Windows signals, vendored paths, tooling configs, corroboration markers) |
+| `--config FILE` | built-in | JSON file overriding any detection matrix (language lists, manifest names, ecosystem pairing map, IaC patterns, Windows signals, vendored paths, tooling configs, corroboration markers). Values are type-checked against the defaults. |
 
 ### Rate Limiting
 
@@ -170,13 +171,15 @@ Empty and disabled repos are always skipped.
 | `--min-interval SECONDS` | `0.25` | Minimum delay between GitHub API calls |
 | `--min-remaining N` | `100` | Sleep until reset when the core rate limit budget drops below this |
 
-The script checks `/rate_limit` every 50 calls, sleeps until reset when the budget runs low, and backs off exponentially with jitter on secondary rate limit responses. Roughly 2 API calls per repo (languages + recursive tree); existing `veracode.yml` presence and its SHA are read from the same tree call.
+The script checks `/rate_limit` every 50 calls, sleeps until reset when the budget runs low, and backs off exponentially with jitter on secondary rate limit responses. Language data is prefetched in batches of 40 repos per GraphQL call (disable with `--no-graphql`); any repo missing from a batch, and every repo when the GraphQL endpoint is unhealthy, falls back to its own REST call, so batching can only reduce API usage, never change results. With batching the cost is roughly 1 API call per repo (recursive tree) plus 1 per 40 repos (languages); existing `veracode.yml` presence and its SHA are read from the same tree call.
 
 ### Output
 
 | Flag | Default | Description |
 |---|---|---|
-| `--report FILE` | none | Write a JSON audit report: per-repo languages, decisions, reasons, and whether an override was written |
+| `--report FILE` | none | Write a JSON audit report: per-repo languages, decisions, reasons, full detection evidence, and whether an override was written. Written even when the run is interrupted (Ctrl-C) or crashes, with an `interrupted` flag. |
+| `--resume-from FILE` | none | Skip repos that already reached a terminal outcome (`no_change`, `already_correct`, `committed`, `pr_opened`, `skipped_existing_file`) in a prior `--report` JSON. Failed and dry-run outcomes are retried. The new report contains only newly processed repos. |
+| `--no-graphql` | off | Disable batched GraphQL language prefetching and use one REST call per repo instead |
 | `--csv FILE` | `dry_run_report.csv` on `--dry-run`, off otherwise | Write a flat CSV: one row per repo with scan decisions, reasons, runner, languages, and outcome. Auto-generated on every dry run; pass explicitly to also get one on an apply run. |
 | `-v`, `--verbose` | off | Debug-level logging, including the per-scan-type reasoning for every repo |
 
@@ -208,7 +211,7 @@ Only the disabled sections are written; everything else inherits the central con
 
 ```yaml
 # Detection: SAST=True (languages=['C#'])
-#            SCA=True (manifests=['packages.config'], ecosystems=['C#'])
+#            SCA=True (manifests=['packages.config'], ecosystems=['C#']; paired=['dotnet'])
 #            IaC=True (no artifacts detected, kept enabled for secret scanning)
 #            Runner=windows-latest (windows signals=['global.asax', 'packages.config'])
 
