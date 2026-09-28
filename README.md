@@ -362,29 +362,6 @@ Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv 
 
 -----
 
-## Upgrading from the previous version
-
-Files written by the previous version (first line `# Detection:`) are recognized as managed. Two default changes alter their settings, so the first run proposes a one-time update PR on those repos:
-
-- Disabled scans now also get `issues: trigger: false`. Pass `--keep-issue-triggers` to keep the old settings.
-- Windows-bound repos now get the build-scoped runner (`actions: <scan>: build: runs_on`) instead of `default: runs_on`. Pass `--runner-scope all` to keep the old settings.
-
-Run `--dry-run` first: repos that would change show `would_write` with `existing_file: managed`. Also expect SAST to be proposed off for COBOL, Swift/Objective-C, and build-less C/C++ repos, SCA off for repos whose only manifests are Makefile/Gemfile/Podfile or supporting files, and SCA on for manifest-only repos such as notebooks with `requirements.txt`.
-
-**Pilot check for the build-scoped runner.** The per-scan `actions: veracode_sca_scan: build: runs_on` key is documented, but the integration's public SCA workflow runs its job on `default_runs_on`. On a pilot .NET Framework repo, confirm the SCA scan succeeds with the default `--runner-scope build`; if it does not, use `--runner-scope all`.
-
------
-
-## Tests
-
-Standard library only, no network or token needed (a stateful fake `gh` lives in `tests/fake_gh/`):
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
------
-
 ## Support
 
 This is a companion tool to Veracode's GitHub Workflow Integration and is not officially supported by Veracode. For issues, provide the `--report` JSON output, the `--org` used, and the command run.
