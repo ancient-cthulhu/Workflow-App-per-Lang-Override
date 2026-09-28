@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-Requirements: GITHUB_TOKEN environment variable with scopes repo, workflow, read:org. Python 3.9+, stdlib only.
+Requirements: an authenticated gh CLI (GH_TOKEN, GITHUB_TOKEN, or `gh auth
+login`) with scopes repo, workflow, read:org. Python 3.9+, stdlib only.
 
 Usage:
   python3 script.py --org my-org --dry-run --report audit.json
   python3 script.py --org my-org
-  python3 script.py --org my-org --no-iac --direct-commit
+  python3 script.py --org my-org --iac artifacts --direct-commit
+  python3 script.py --org my-org --resume-from run1.json --report run2.json
+
+Tests:
+  python3 -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from urllib.parse import quote
 
@@ -49,6 +55,9 @@ DEFAULT_MATRICES: dict = {
     # language should not be silently opted out based on today's packager.
     # NOT included: Perl, PL/SQL, T-SQL, Classic ASP, RPG, VB6, Dart - those
     # are platform Static Analysis (Upload and Scan) only, not pipeline.
+    # Also NOT included, see the disable tiers below: COBOL, Swift,
+    # Objective-C. They are Pipeline Scan languages, but the integration's
+    # own build cannot produce an artifact for them.
     "SAST_LANGUAGES": [
         "C#", "F#", "Visual Basic .NET", "ASP.NET",
         "Go",
@@ -61,18 +70,48 @@ DEFAULT_MATRICES: dict = {
         "Scala",
         "Apex",
         "ColdFusion",
-        "Swift", "Objective-C",
         "C", "C++",
-        "COBOL",
     ],
-    # Optional disable tiers, EMPTY by default. If packaging failures become
-    # a PR-blocking problem for specific ecosystems in your org, move those
-    # languages out of SAST_LANGUAGES into the matching tier via --config to
-    # disable them with an explanatory reason:
-    #   SAST_PIPELINE_NOT_AUTOPACKAGED - packager does not build them yet
-    #   SAST_COMPILED_ONLY - need preprocessed/compiled artifacts (e.g. C/C++)
-    "SAST_PIPELINE_NOT_AUTOPACKAGED": [],
+    # Disable tiers. A language listed here does not enable SAST, and the
+    # tier name plus its explanation is recorded in the file header, PR
+    # body, and report. Move languages between SAST_LANGUAGES and these
+    # tiers via --config ("+KEY" / "-KEY") as the integration evolves.
+    #   SAST_PIPELINE_NOT_AUTOPACKAGED - the integration's pipeline build
+    #     skips the packager. Verified in veracode/github-actions-integration
+    #     (veracode-default-build.yml): pipeline builds run
+    #     "veracode package ... --skip-packagers sql,cobol" and the upload
+    #     step uses if-no-files-found: error, so a COBOL-only repo fails.
+    #   SAST_NO_SUPPORTED_RUNNER - packaging needs a build host the
+    #     integration does not provide. Apple packaging requires Xcode
+    #     (macOS); the integration's build has Linux and Windows jobs only.
+    #   SAST_COMPILED_ONLY - need preprocessed/compiled artifacts.
+    "SAST_PIPELINE_NOT_AUTOPACKAGED": ["COBOL"],
+    "SAST_NO_SUPPORTED_RUNNER": ["Swift", "Objective-C"],
     "SAST_COMPILED_ONLY": [],
+    # Languages that only count toward SAST when a build system is present.
+    # C/C++ autopackaging needs make/ninja/bitbake and a successful compile
+    # (MSVC projects are handled by the Windows runner). Headers or a few
+    # sources without any build definition have nothing to build and the
+    # pipeline scan fails. Truncated trees fail open.
+    "SAST_BUILD_EVIDENCE": {
+        "C": {"names": ["makefile", "gnumakefile", "cmakelists.txt",
+                        "meson.build", "build.ninja", "configure.ac",
+                        "configure", "sconstruct"],
+              "suffixes": [".vcxproj", ".vcproj", ".mk", ".bb"]},
+        "C++": {"names": ["makefile", "gnumakefile", "cmakelists.txt",
+                          "meson.build", "build.ninja", "configure.ac",
+                          "configure", "sconstruct"],
+                "suffixes": [".vcxproj", ".vcproj", ".mk", ".bb"]},
+    },
+    # Linguist reports some languages under their own names rather than the
+    # group name (TSX, Objective-C++, ColdFusion CFC, Java Server Pages).
+    # They are folded into the canonical name before any decision.
+    "LANGUAGE_ALIASES": {
+        "TSX": "TypeScript",
+        "Objective-C++": "Objective-C",
+        "ColdFusion CFC": "ColdFusion",
+        "Java Server Pages": "Java",
+    },
     # Extension fallback used when the languages API is empty or the tree is
     # truncated. Maps extension -> Linguist name (checked against the sets above).
     "CODE_EXTENSIONS": {
@@ -114,7 +153,11 @@ DEFAULT_MATRICES: dict = {
         "Scala",
     ],
     # Manifests / lockfiles the SCA agent can resolve, per package manager rows
-    # in the agent support table. Exact lowercase basenames.
+    # in the agent support table. Exact lowercase basenames. These are all
+    # DETECTED and reported, but only manifests belonging to a group in
+    # SCA_ECOSYSTEM_MAP whose languages are in SCA_LANGUAGES ENABLE SCA.
+    # Gemfile, Podfile and Makefile are listed so the report can say "found
+    # but not integration-supported"; they never enable SCA on their own.
     "SCA_MANIFEST_NAMES": [
         # Java/Kotlin/Scala: Maven, Gradle, Ant/Ivy, SBT (+ wrappers, catalogs)
         "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle",
@@ -149,11 +192,31 @@ DEFAULT_MATRICES: dict = {
     # .sbt covers plugins.sbt and other sbt build definitions.
     "SCA_MANIFEST_SUFFIXES": [".csproj", ".fsproj", ".vbproj", ".sln",
                               ".nuspec", ".jar", ".dll", ".sbt"],
-    # Manifest -> ecosystem pairing, used for confidence annotation and
-    # explainability. Pairing does NOT gate the SCA decision: a stray
-    # pom.xml in a Python repo is still a real, resolvable dependency tree
-    # worth scanning (fail-open), but the report should say whether the
-    # manifests match the detected languages or not.
+    # Build-support files that belong to an ecosystem but do not declare a
+    # resolvable dependency tree on their own. They are reported and count
+    # toward pairing, but never enable SCA alone: a repo whose only .NET file
+    # is global.json, or whose only Python file is a setup.cfg holding
+    # flake8 settings, makes the agent fail with "no build system found".
+    "SCA_SUPPORTING_NAMES": [
+        "global.json", "directory.build.props", "directory.packages.props",
+        "gradlew", "mvnw", "libs.versions.toml", "setup.cfg",
+        "pnpm-workspace.yaml", "go.work.sum",
+    ],
+    "SCA_SUPPORTING_SUFFIXES": [".sln"],
+    # Basenames never treated as dependency evidence. Build-tool wrapper jars
+    # ship with every Gradle/Maven project (including React Native and
+    # Flutter android/ folders) and are not application dependencies.
+    "SCA_IGNORED_NAMES": ["gradle-wrapper.jar", "maven-wrapper.jar"],
+    # Manifest -> ecosystem map. This is what ENABLES SCA: at least one
+    # non-supporting manifest from a group whose languages intersect
+    # SCA_LANGUAGES. The ecosystem is taken from the manifest itself, so a
+    # notebook repo with requirements.txt (Linguist: "Jupyter Notebook") is
+    # still scanned. Language pairing is recorded for explainability only:
+    # a stray pom.xml in a Python repo is still a real, resolvable
+    # dependency tree (fail-open), and the reason says it was unpaired.
+    # To scan ecosystems the integration does not support (for example
+    # Ruby when running the agent elsewhere), add a group here and its
+    # language to SCA_LANGUAGES via --config.
     "SCA_ECOSYSTEM_MAP": {
         "java": {
             "languages": ["Java", "Kotlin", "Groovy", "Scala"],
@@ -305,9 +368,11 @@ DEFAULT_MATRICES: dict = {
                                 ".min.mjs", ".pb.go", "_pb2.py", ".g.cs",
                                 ".designer.cs", ".generated.cs",
                                 ".d.ts", ".pb.cc", ".pb.h", "_pb.js"],
-    # Build-tool configuration files excluded from extension-language
-    # detection. A repo whose only .js/.ts files are these is not a
-    # JavaScript project (docs sites, Python repos with frontend tooling).
+    # Build-tool configuration files excluded from language classification.
+    # A repo whose only .js/.ts files are these is not a JavaScript project
+    # (docs sites, Python repos with frontend tooling). Linguist does NOT
+    # exclude these files itself, so their tree sizes are also subtracted
+    # from the Linguist byte counts before MIN_LANGUAGE_BYTES is applied.
     # They do NOT affect SCA manifest detection: if package.json exists, the
     # repo has an npm dependency tree worth scanning regardless.
     "TOOLING_CONFIG_BASENAMES": [
@@ -342,6 +407,16 @@ DEFAULT_MATRICES: dict = {
         "eslint.config", "commitlint.config", "stylelint.config",
         "tsup.config", "astro.config",
     ],
+    # Framework scaffolding: when the ROOT marker file exists, the listed
+    # top-level directories hold generated platform runners, not first-party
+    # code, and are excluded from language classification (Linguist bytes
+    # are subtracted), SCA manifest detection, and Windows signals. A
+    # `flutter create` app otherwise shows ~20 KB of C++ (windows/, linux/),
+    # Swift (ios/, macos/), Kotlin and a Gradle build (android/) that needs
+    # the Flutter SDK, which enables SAST and SCA scans that cannot build.
+    "FRAMEWORK_PLATFORM_DIRS": {
+        "pubspec.yaml": ["android", "ios", "linux", "macos", "windows", "web"],
+    },
     # Minimum byte count for a Linguist API language to count toward scan
     # enablement (filters trivial stubs; the language is still reported).
     "MIN_LANGUAGE_BYTES": 200,
@@ -365,12 +440,53 @@ SECTION_KEYS = {
     "iac": "veracode_iac_secrets_scan",
 }
 
+# issues.trigger is disabled too: the reference central config has an
+# issue-comment trigger per scan ("Veracode Static Scan" etc.), and an org
+# that turns it on would otherwise still run the irrelevant scan on demand.
 DISABLE_BLOCK = """{key}:
   push:
     trigger: false
   pull_request:
     trigger: false
 """
+ISSUES_DISABLE = """  issues:
+    trigger: false
+"""
+
+# First line of every generated file. Files carrying it (or the legacy
+# "# Detection:" header written by earlier versions) are owned by this tool:
+# they are updated when the decision changes and removed when no override is
+# needed any more. Files without it are hand-written and never modified
+# unless --force is passed.
+MANAGED_MARKER = "# managed-by: veracode-scan-scoping"
+LEGACY_MANAGED_PREFIX = "# Detection:"
+
+# Runner labels are written verbatim into YAML. Restrict them to what
+# GitHub runner labels and a YAML flow list can contain, so a --windows-runner
+# value can never inject extra configuration.
+RUNNER_LABEL_RE = re.compile(r"^(\[[A-Za-z0-9_.\-, ]+\]|[A-Za-z0-9_.\-]+)$")
+
+
+def yaml_body(text: str) -> str:
+    """Configuration content with comments and blank lines removed. Used to
+    decide whether an existing file is already correct: the header comment
+    carries detection reasons (file lists, truncation notes) that change
+    without changing any setting, and must not cause churn."""
+    lines = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def is_managed(text: str) -> bool:
+    for line in text.replace("\r\n", "\n").split("\n"):
+        if line.strip():
+            s = line.strip()
+            return s.startswith(MANAGED_MARKER) or s.startswith(LEGACY_MANAGED_PREFIX)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -389,33 +505,80 @@ class GhClient:
     """Wraps the gh CLI with throttling, retries, and rate limit awareness.
 
     - Enforces a minimum interval between API calls (primary rate hygiene).
+    - Paces write requests separately (POST/PUT/PATCH/DELETE and
+      `gh pr create`): GitHub's secondary limits allow roughly 80
+      content-generating requests per minute and 500 per hour, and PR mode
+      makes up to 3 writes per repo. Without pacing an org-wide rollout
+      hits the hourly cap, backs off for ~20 minutes, and marks repos
+      failed while the window is still closed.
     - Every `check_every` calls, queries /rate_limit and sleeps until reset
       if core remaining drops below `min_remaining`.
+    - Every gh invocation has a timeout, so one stalled connection cannot
+      hang an org-wide run. Timeouts are retried like transient errors;
+      every write path in this script is idempotent on retry.
     - Exponential backoff with jitter on secondary rate limit / abuse
       detection responses and transient network errors.
     """
 
-    TRANSIENT_MARKERS = ("timeout", "timed out", "connection reset", "connection refused",
-                        "502", "503", "504", "temporarily unavailable")
-    SECONDARY_MARKERS = ("secondary rate limit", "abuse detection",
-                         "you have exceeded a secondary rate limit")
+    TRANSIENT_RE = re.compile(
+        r"\bhttp 50[0234]\b|timed out|timeout|connection reset|"
+        r"connection refused|temporarily unavailable|bad gateway|"
+        r"service unavailable|unexpected eof|tls handshake")
+    SECONDARY_RE = re.compile(
+        r"secondary rate limit|abuse detection|\bhttp 429\b")
     PRIMARY_MARKERS = ("api rate limit exceeded",)
+    WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
     def __init__(self, min_interval: float = 0.25, min_remaining: int = 100,
-                 check_every: int = 50, max_retries: int = 6):
+                 check_every: int = 50, max_retries: int = 6,
+                 timeout: float = 120.0, write_interval: float = 1.0,
+                 writes_per_hour: int = 450):
         self.min_interval = min_interval
         self.min_remaining = min_remaining
         self.check_every = check_every
         self.max_retries = max_retries
+        self.timeout = timeout
+        self.write_interval = write_interval
+        self.writes_per_hour = writes_per_hour
         self._last_call = 0.0
+        self._last_write = 0.0
+        self._write_times: deque[float] = deque()
         self._calls_since_check = 0
         self.api_calls = 0
+        self.write_calls = 0
+
+    @classmethod
+    def is_write(cls, args: list[str]) -> bool:
+        if args[:2] in (["pr", "create"], ["pr", "close"]):
+            return True
+        for i, a in enumerate(args[:-1]):
+            if a in ("-X", "--method") and args[i + 1].upper() in cls.WRITE_METHODS:
+                return True
+        return False
 
     def _throttle(self) -> None:
         wait = self.min_interval - (time.monotonic() - self._last_call)
         if wait > 0:
             time.sleep(wait)
         self._last_call = time.monotonic()
+
+    def _pace_write(self) -> None:
+        now = time.monotonic()
+        while self._write_times and now - self._write_times[0] >= 3600:
+            self._write_times.popleft()
+        if self.writes_per_hour > 0 and len(self._write_times) >= self.writes_per_hour:
+            sleep_for = 3600 - (now - self._write_times[0]) + 1
+            log.warning("Write budget of %d/hour reached (GitHub secondary "
+                        "limit hygiene). Sleeping %.0fs.", self.writes_per_hour,
+                        sleep_for)
+            time.sleep(sleep_for)
+            self._write_times.popleft()
+        wait = self.write_interval - (time.monotonic() - self._last_write)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_write = time.monotonic()
+        self._write_times.append(self._last_write)
+        self.write_calls += 1
 
     def _maybe_check_rate_limit(self) -> None:
         self._calls_since_check += 1
@@ -437,8 +600,16 @@ class GhClient:
 
     def _run_once(self, args: list[str]) -> str:
         self._throttle()
-        proc = subprocess.run(["gh"] + args, capture_output=True, text=True)
+        if self.is_write(args):
+            self._pace_write()
         self.api_calls += 1
+        try:
+            proc = subprocess.run(["gh"] + args, capture_output=True, text=True,
+                                  timeout=self.timeout)
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+            raise GhError(["gh"] + args, -1,
+                          f"gh timed out after {self.timeout:.0f}s", out)
         if proc.returncode == 0:
             return proc.stdout
         raise GhError(["gh"] + args, proc.returncode, proc.stderr or "",
@@ -449,10 +620,12 @@ class GhClient:
         is_api = args and args[0] == "api"
         if is_api:
             self._maybe_check_rate_limit()
+        last: GhError | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 return self._run_once(args)
             except GhError as e:
+                last = e
                 stderr = e.stderr.lower()
                 for status in ok_statuses:
                     # Word-bounded match on gh's "HTTP 404" error format. The
@@ -462,7 +635,7 @@ class GhClient:
                         log.debug("Treating HTTP %s as absence: %s",
                                   status, " ".join(e.cmd))
                         return ""
-                if any(m in stderr for m in self.SECONDARY_MARKERS):
+                if self.SECONDARY_RE.search(stderr):
                     wait = min(60 * attempt, 300) + random.uniform(0, 10)
                     log.warning("Secondary rate limit hit. Backing off %.0fs "
                                 "(attempt %d/%d).", wait, attempt, self.max_retries)
@@ -475,15 +648,15 @@ class GhClient:
                     self._calls_since_check = self.check_every  # force check
                     self._maybe_check_rate_limit()
                     continue
-                if any(m in stderr for m in self.TRANSIENT_MARKERS) \
-                        and attempt < self.max_retries:
+                if self.TRANSIENT_RE.search(stderr) and attempt < self.max_retries:
                     wait = min(2 ** attempt, 30) + random.uniform(0, 2)
                     log.warning("Transient error, retrying in %.0fs: %s",
                                 wait, e.stderr.strip()[:150])
                     time.sleep(wait)
                     continue
                 raise
-        raise GhError(["gh"] + args, -1, "retries exhausted")
+        raise GhError(["gh"] + args, -1, "retries exhausted; last error: "
+                      + (last.stderr.strip()[:300] if last else ""))
 
     def json(self, args: list[str], **kw):
         out = self.run(args, **kw)
@@ -585,7 +758,11 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
         group = names[i:i + chunk]
         parts = [
             f"r{j}: repository(owner: {json.dumps(org)}, name: {json.dumps(n)}) "
-            "{ languages(first: 30) { edges { size node { name } } } }"
+            # Explicit SIZE DESC order: the schema defines no default order,
+            # so a plain first:N could drop the dominant language on repos
+            # with many small ones. 100 matches the REST endpoint's output.
+            "{ languages(first: 100, orderBy: {field: SIZE, direction: DESC}) "
+            "{ edges { size node { name } } } }"
             for j, n in enumerate(group)
         ]
         query = "query { " + " ".join(parts) + " }"
@@ -621,7 +798,18 @@ def fetch_tree(gh: GhClient, org: str, repo: str, branch: str,
     url = f"repos/{org}/{repo}/git/trees/{quote(branch, safe='')}"
     if recursive:
         url += "?recursive=1"
-    data = gh.json(["api", url], ok_statuses=(404, 409))  # 409 = empty repo
+    # 409 = empty repository, a real absence. 404 is NOT treated as absence:
+    # it means the tree could not be read (permissions, SSO, a transient
+    # ref problem). Treating it as "no files" disabled SCA on repos with
+    # real manifests (fail-closed), so it now fails the repo instead.
+    try:
+        data = gh.json(["api", url], ok_statuses=(409,))
+    except GhError as e:
+        if re.search(r"\bhttp 404\b", e.stderr.lower()):
+            raise GhError(e.cmd, e.returncode,
+                          "git tree not readable (HTTP 404); refusing to decide "
+                          "scans without file evidence", e.stdout) from e
+        raise
     if not data:
         return [], False
     entries = [e for e in data.get("tree", []) if e.get("type") == "blob"]
@@ -661,15 +849,11 @@ def inspect_repo(gh: GhClient, org: str, repo: dict,
     return info
 
 
-def fetch_file_text_lower(gh: GhClient, org: str, repo: str, branch: str,
-                          path: str) -> str | None:
-    """Fetch a file via the contents API and return lowercased text, or None
-    if it can't be fetched/decoded. BOM-aware: Visual Studio occasionally
-    writes UTF-16 project files, which a plain utf-8 decode with
-    errors='ignore' turns into null-interleaved text that silently defeats
-    every substring marker."""
-    data = gh.json(["api", f"repos/{org}/{repo}/contents/{quote(path)}?ref={quote(branch, safe='')}"],
-                   ok_statuses=(404,))
+def _decode_blob(data) -> str | None:
+    """Decode a base64 contents/blob API payload. BOM-aware: Visual Studio
+    occasionally writes UTF-16 project files, which a plain utf-8 decode
+    with errors='ignore' turns into null-interleaved text that silently
+    defeats every substring marker."""
     if not isinstance(data, dict) or data.get("encoding") != "base64":
         return None
     try:
@@ -677,10 +861,26 @@ def fetch_file_text_lower(gh: GhClient, org: str, repo: str, branch: str,
     except Exception:
         return None
     if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        text = raw.decode("utf-16", errors="ignore")
-    else:
-        text = raw.decode("utf-8-sig", errors="ignore")
-    return text.lower()
+        return raw.decode("utf-16", errors="ignore")
+    return raw.decode("utf-8-sig", errors="ignore")
+
+
+def fetch_file_text_lower(gh: GhClient, org: str, repo: str, branch: str,
+                          path: str) -> str | None:
+    """Fetch a file via the contents API and return lowercased text, or None
+    if it can't be fetched/decoded."""
+    data = gh.json(["api", f"repos/{org}/{repo}/contents/{quote(path)}?ref={quote(branch, safe='')}"],
+                   ok_statuses=(404,))
+    text = _decode_blob(data)
+    return text.lower() if text is not None else None
+
+
+def fetch_blob_text(gh: GhClient, org: str, repo: str, sha: str) -> str | None:
+    """Exact content of the blob the tree listing pointed at (no ref race
+    between the tree read and the content read)."""
+    data = gh.json(["api", f"repos/{org}/{repo}/git/blobs/{quote(sha, safe='')}"],
+                   ok_statuses=(404,))
+    return _decode_blob(data)
 
 
 def deep_iac_confirm(gh: GhClient, org: str, repo: str, branch: str,
@@ -699,7 +899,8 @@ def deep_iac_confirm(gh: GhClient, org: str, repo: str, branch: str,
 def scan_windows_signals(paths: list[str], mx: Matrices) -> tuple[set, set, list]:
     """Return (strong_hits, weak_hits, project_files) for Windows runner
     detection, ignoring vendored/generated paths (a packages.config inside a
-    committed dependency must not force a Windows runner). project_files are
+    committed dependency must not force a Windows runner) and framework
+    platform folders (Flutter's windows/ runner). project_files are
     .csproj/.vbproj/.fsproj paths, the candidates for content inspection,
     ordered so that projects sharing a directory subtree with a weak signal
     (the file that motivated the inspection) come first, then shallowest:
@@ -707,9 +908,10 @@ def scan_windows_signals(paths: list[str], mx: Matrices) -> tuple[set, set, list
     projects most likely to carry the Windows marker."""
     strong, weak, projects = set(), set(), []
     weak_dirs: set[str] = set()
+    fw_dirs = framework_excluded_dirs(paths, mx)
     for p in paths:
         lp = p.lower()
-        if not is_scannable_path(lp, mx):
+        if not is_scannable_path(lp, mx, framework_dirs=fw_dirs):
             continue
         base = lp.rsplit("/", 1)[-1]
         if base in mx.windows_file_names or base.endswith(mx.windows_file_suffixes):
@@ -759,84 +961,209 @@ def deep_dotnet_check(gh: GhClient, org: str, repo: str, branch: str,
 # Decision logic
 # ---------------------------------------------------------------------------
 
+SAST_TIER_EXPLANATIONS = {
+    "SAST_PIPELINE_NOT_AUTOPACKAGED":
+        "integration pipeline build skips this packager",
+    "SAST_NO_SUPPORTED_RUNNER":
+        "packaging needs a macOS/Xcode build host; the integration builds on "
+        "Linux/Windows only",
+    "SAST_COMPILED_ONLY":
+        "needs preprocessed/compiled artifacts",
+}
+
+
+def _check_shape(path: str, val, proto, record: bool = False) -> None:
+    """Validate a --config value against the shape of its default. Top-level
+    objects are open maps (any key, values shaped like the existing ones);
+    nested objects are records (only the keys the default has). Catching
+    this at startup beats a traceback, or worse, silently wrong detection,
+    halfway through an org-wide run."""
+    if isinstance(proto, bool):
+        if not isinstance(val, bool):
+            raise ValueError(f"Config {path} must be true/false")
+    elif isinstance(proto, int):
+        if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+            raise ValueError(f"Config {path} must be a non-negative integer")
+    elif isinstance(proto, str):
+        if not isinstance(val, str):
+            raise ValueError(f"Config {path} must be a string, got "
+                             f"{type(val).__name__}")
+    elif isinstance(proto, list):
+        # A bare string where a list is expected would otherwise be iterated
+        # per character, turning ".jar" into suffixes '.', 'j', 'a', 'r' that
+        # match nearly every file.
+        if not isinstance(val, list):
+            raise ValueError(f"Config {path} must be a list, got "
+                             f"{type(val).__name__}")
+        elem = proto[0] if proto else ""
+        for i, v in enumerate(val):
+            _check_shape(f"{path}[{i}]", v, elem, record=True)
+    elif isinstance(proto, dict):
+        if not isinstance(val, dict):
+            raise ValueError(f"Config {path} must be an object, got "
+                             f"{type(val).__name__}")
+        for k, v in val.items():
+            if record:
+                if k not in proto:
+                    raise ValueError(f"Config {path}: unknown key {k!r}, "
+                                     f"expected one of {sorted(proto)}")
+                sub = proto[k]
+            else:
+                sub = proto.get(k, next(iter(proto.values())) if proto else "")
+            _check_shape(f"{path}.{k}", v, sub, record=True)
+
+
+def merge_config(overrides: dict | None) -> dict:
+    """Apply --config overrides to a copy of DEFAULT_MATRICES.
+
+      "KEY":  value   replaces the default entirely
+      "+KEY": value   appends list items / adds or replaces object entries
+      "-KEY": [items] removes list items (case-insensitive) / object keys
+
+    Replacing is rarely what you want for detection lists: replacing
+    SCA_MANIFEST_NAMES with three names silently disables SCA for every
+    other ecosystem. Prefer "+"/"-"."""
+    m = json.loads(json.dumps(DEFAULT_MATRICES))  # deep copy
+    if overrides is None:
+        return m
+    if not isinstance(overrides, dict):
+        raise ValueError("Config file must contain a JSON object")
+    # Plain replacements first, so "+KEY"/"-KEY" apply on top of them.
+    items = sorted(overrides.items(), key=lambda kv: kv[0][:1] in "+-")
+    for raw_key, val in items:
+        op, key = (raw_key[0], raw_key[1:]) if raw_key[:1] in "+-" else ("", raw_key)
+        if key not in m:
+            raise ValueError(f"Unknown config key: {raw_key}. Valid keys "
+                             f"(optionally prefixed with + or -): {sorted(m)}")
+        default = DEFAULT_MATRICES[key]
+        if op and not isinstance(default, (list, dict)):
+            raise ValueError(f"Config {raw_key}: +/- only apply to lists and "
+                             f"objects; use {key} to replace the value")
+        if op == "-":
+            _check_shape(raw_key, val, [""])
+            drop = {v.lower() for v in val}
+            if isinstance(m[key], list):
+                m[key] = [v for v in m[key] if str(v).lower() not in drop]
+            else:
+                m[key] = {k: v for k, v in m[key].items() if k.lower() not in drop}
+            continue
+        _check_shape(raw_key, val, default)
+        if op == "+":
+            if isinstance(m[key], list):
+                have = {str(v).lower() for v in m[key]}
+                m[key] = m[key] + [v for v in val if str(v).lower() not in have]
+            else:
+                merged = dict(m[key])
+                merged.update(val)
+                m[key] = merged
+        else:
+            m[key] = val
+    try:
+        re.compile(m["WINDOWS_TFM_REGEX"])
+    except re.error as e:
+        raise ValueError(f"Config WINDOWS_TFM_REGEX is not a valid regex: {e}")
+    return m
+
+
 class Matrices:
     def __init__(self, overrides: dict | None = None):
-        m = json.loads(json.dumps(DEFAULT_MATRICES))  # deep copy
-        for key, val in (overrides or {}).items():
-            if key not in m:
-                raise ValueError(f"Unknown config key: {key}. "
-                                 f"Valid keys: {sorted(m)}")
-            # Type-check against the default. Passing a bare string where a
-            # list is expected would otherwise be iterated per-character,
-            # silently turning e.g. ".jar" into suffixes ('.', 'j', 'a', 'r')
-            # that match nearly every file.
-            if not isinstance(val, type(m[key])):
-                raise ValueError(
-                    f"Config key {key} must be a "
-                    f"{type(m[key]).__name__}, got {type(val).__name__}")
-            m[key] = val
-        self.sast_languages = set(m["SAST_LANGUAGES"])
-        self.sast_not_autopackaged = set(m.get("SAST_PIPELINE_NOT_AUTOPACKAGED", []))
-        self.sast_compiled_only = set(m.get("SAST_COMPILED_ONLY", []))
+        m = merge_config(overrides)
+        self.sast_tiers: list[tuple[str, set[str]]] = [
+            ("SAST_PIPELINE_NOT_AUTOPACKAGED", set(m["SAST_PIPELINE_NOT_AUTOPACKAGED"])),
+            ("SAST_NO_SUPPORTED_RUNNER", set(m["SAST_NO_SUPPORTED_RUNNER"])),
+            ("SAST_COMPILED_ONLY", set(m["SAST_COMPILED_ONLY"])),
+        ]
+        # A tier always wins over SAST_LANGUAGES, so "+SAST_COMPILED_ONLY"
+        # alone is enough to disable a language.
+        tiered = set().union(*(members for _, members in self.sast_tiers))
+        self.sast_languages = set(m["SAST_LANGUAGES"]) - tiered
+        self.sast_build_evidence = {
+            lang: ({n.lower() for n in spec.get("names", [])},
+                   tuple(s.lower() for s in spec.get("suffixes", [])))
+            for lang, spec in m["SAST_BUILD_EVIDENCE"].items()}
+        self.language_aliases = dict(m["LANGUAGE_ALIASES"])
         self.sca_languages = set(m["SCA_LANGUAGES"])
         self.code_extensions = {k.lower(): v for k, v in m["CODE_EXTENSIONS"].items()}
-        self.sca_manifest_names = {n.lower() for n in m["SCA_MANIFEST_NAMES"]}
-        self.sca_manifest_suffixes = tuple(s.lower() for s in m["SCA_MANIFEST_SUFFIXES"])
         self.sca_ecosystem_map: list[tuple[str, set, set, tuple]] = []
-        for group, spec in m.get("SCA_ECOSYSTEM_MAP", {}).items():
+        for group, spec in m["SCA_ECOSYSTEM_MAP"].items():
             self.sca_ecosystem_map.append((
                 group,
                 set(spec.get("languages", [])),
                 {n.lower() for n in spec.get("names", [])},
                 tuple(s.lower() for s in spec.get("suffixes", [])),
             ))
+        # Every name/suffix of an ecosystem group is detected even if the
+        # user forgot to also add it to SCA_MANIFEST_NAMES/SUFFIXES.
+        self.sca_manifest_names = {n.lower() for n in m["SCA_MANIFEST_NAMES"]}
+        self.sca_manifest_names |= set().union(*(g[2] for g in self.sca_ecosystem_map))
+        self.sca_manifest_suffixes = tuple(sorted(
+            {s.lower() for s in m["SCA_MANIFEST_SUFFIXES"]}
+            | {s for g in self.sca_ecosystem_map for s in g[3]}))
+        self.sca_supporting_names = {n.lower() for n in m["SCA_SUPPORTING_NAMES"]}
+        self.sca_supporting_suffixes = tuple(
+            s.lower() for s in m["SCA_SUPPORTING_SUFFIXES"])
+        self.sca_ignored_names = {n.lower() for n in m["SCA_IGNORED_NAMES"]}
         self.iac_file_names = {n.lower() for n in m["IAC_FILE_NAMES"]}
         self.iac_file_suffixes = tuple(s.lower() for s in m["IAC_FILE_SUFFIXES"])
         self.iac_name_prefixes = tuple(p.lower() for p in m["IAC_NAME_PREFIXES"])
         self.iac_dir_hints = tuple(d.lower() for d in m["IAC_DIR_HINTS"])
         self.iac_languages = set(m["IAC_LANGUAGES"])
-        self.windows_file_names = {n.lower() for n in m.get("WINDOWS_FILE_NAMES", [])}
-        self.windows_file_suffixes = tuple(
-            s.lower() for s in m.get("WINDOWS_FILE_SUFFIXES", []))
-        self.windows_weak_names = {n.lower() for n in m.get("WINDOWS_WEAK_FILE_NAMES", [])}
+        self.windows_file_names = {n.lower() for n in m["WINDOWS_FILE_NAMES"]}
+        self.windows_file_suffixes = tuple(s.lower() for s in m["WINDOWS_FILE_SUFFIXES"])
+        self.windows_weak_names = {n.lower() for n in m["WINDOWS_WEAK_FILE_NAMES"]}
         self.windows_weak_suffixes = tuple(
-            s.lower() for s in m.get("WINDOWS_WEAK_FILE_SUFFIXES", []))
+            s.lower() for s in m["WINDOWS_WEAK_FILE_SUFFIXES"])
         self.windows_project_markers = tuple(
-            s.lower() for s in m.get("WINDOWS_PROJECT_MARKERS", []))
-        self.windows_tfm_regex = re.compile(
-            m.get("WINDOWS_TFM_REGEX", r"<targetframeworks?>[^<]*-windows"))
-        self.windows_corr_languages = set(
-            m.get("WINDOWS_CORROBORATION_LANGUAGES", []))
-        self.vendored_segments = {s.lower() for s in m.get("VENDORED_PATH_SEGMENTS", [])}
+            s.lower() for s in m["WINDOWS_PROJECT_MARKERS"])
+        self.windows_tfm_regex = re.compile(m["WINDOWS_TFM_REGEX"])
+        self.windows_corr_languages = set(m["WINDOWS_CORROBORATION_LANGUAGES"])
+        self.vendored_segments = {s.lower() for s in m["VENDORED_PATH_SEGMENTS"]}
         self.classification_vendored = {
-            s.lower() for s in m.get("CLASSIFICATION_VENDORED_SEGMENTS", [])}
-        self.generated_suffixes = tuple(
-            s.lower() for s in m.get("GENERATED_FILE_SUFFIXES", []))
+            s.lower() for s in m["CLASSIFICATION_VENDORED_SEGMENTS"]}
+        self.generated_suffixes = tuple(s.lower() for s in m["GENERATED_FILE_SUFFIXES"])
         self.tooling_config_basenames = {
-            n.lower() for n in m.get("TOOLING_CONFIG_BASENAMES", [])}
+            n.lower() for n in m["TOOLING_CONFIG_BASENAMES"]}
         # Expand <stem>.<ext> across all JS/TS module extensions so
         # webpack.config.ts, vite.config.mjs etc. are covered without
         # enumerating every combination by hand.
-        for stem in m.get("TOOLING_CONFIG_STEMS", []):
+        for stem in m["TOOLING_CONFIG_STEMS"]:
             for ext in (".js", ".cjs", ".mjs", ".ts", ".mts", ".cts"):
                 self.tooling_config_basenames.add(stem.lower() + ext)
-        self.min_language_bytes = int(m.get("MIN_LANGUAGE_BYTES", 0))
-        self.apple_corr_names = {n.lower() for n in m.get("APPLE_CORROBORATION_NAMES", [])}
+        self.framework_platform_dirs = {
+            marker.lower(): [d.strip("/").lower() for d in dirs]
+            for marker, dirs in m["FRAMEWORK_PLATFORM_DIRS"].items()}
+        self.min_language_bytes = int(m["MIN_LANGUAGE_BYTES"])
+        self.apple_corr_names = {n.lower() for n in m["APPLE_CORROBORATION_NAMES"]}
         self.apple_corr_suffixes = tuple(
-            s.lower() for s in m.get("APPLE_CORROBORATION_SUFFIXES", []))
-        self.sf_corr_names = {n.lower() for n in m.get("SALESFORCE_CORROBORATION_NAMES", [])}
-        self.sf_corr_segments = {s.lower() for s in m.get("SALESFORCE_CORROBORATION_SEGMENTS", [])}
+            s.lower() for s in m["APPLE_CORROBORATION_SUFFIXES"])
+        self.sf_corr_names = {n.lower() for n in m["SALESFORCE_CORROBORATION_NAMES"]}
+        self.sf_corr_segments = {s.lower() for s in m["SALESFORCE_CORROBORATION_SEGMENTS"]}
+
+
+def framework_excluded_dirs(paths: list[str], mx: Matrices) -> tuple[str, ...]:
+    """Lowercase "dir/" prefixes of framework platform folders to ignore.
+    Active only when the framework's marker file is at the repo root."""
+    root_files = {p.lower() for p in paths if "/" not in p}
+    out: list[str] = []
+    for marker, dirs in mx.framework_platform_dirs.items():
+        if marker in root_files:
+            out.extend(d + "/" for d in dirs if d)
+    return tuple(out)
 
 
 def is_scannable_path(lower_path: str, mx: Matrices,
-                      classification: bool = False) -> bool:
+                      classification: bool = False,
+                      framework_dirs: tuple[str, ...] = ()) -> bool:
     """False for vendored/generated content that must not classify a repo:
-    committed node_modules, build output, virtualenvs, minified bundles.
+    committed node_modules, build output, virtualenvs, minified bundles,
+    and framework platform scaffolding (framework_dirs).
 
     classification=True additionally excludes segments like env/ and
     external/ that are usually vendored code for language purposes but may
     legitimately hold manifests and IaC (env/prod/main.tf)."""
     if lower_path.endswith(mx.generated_suffixes):
+        return False
+    if framework_dirs and lower_path.startswith(framework_dirs):
         return False
     for seg in lower_path.split("/")[:-1]:  # directory segments only
         if seg in mx.vendored_segments:
@@ -846,17 +1173,79 @@ def is_scannable_path(lower_path: str, mx: Matrices,
     return True
 
 
-def filtered_entries(info: RepoInfo, mx: Matrices,
-                     classification: bool = False) -> list[tuple[str, str, int | None]]:
+def filtered_entries(info: RepoInfo, mx: Matrices, classification: bool = False,
+                     framework_dirs: tuple[str, ...] = ()
+                     ) -> list[tuple[str, str, int | None]]:
     """(lower_path, lower_basename, blob_size) tuples for non-vendored paths.
     blob_size is None when the tree API omitted it (treated as unknown, which
     fails open in size-gated checks)."""
     out = []
     for p in info.paths:
         lp = p.lower()
-        if is_scannable_path(lp, mx, classification=classification):
+        if is_scannable_path(lp, mx, classification=classification,
+                             framework_dirs=framework_dirs):
             out.append((lp, lp.rsplit("/", 1)[-1], info.sizes.get(p)))
     return out
+
+
+def _ext_languages(base: str, mx: Matrices) -> tuple[str, ...]:
+    """Languages a file counts toward by extension. Headers are ambiguous
+    (C, C++, Objective-C) and count toward all three."""
+    dot = base.rfind(".")
+    if dot == -1:
+        return ()
+    ext = base[dot:]
+    if ext == ".h":
+        return ("C", "C++", "Objective-C")
+    lang = mx.code_extensions.get(ext)
+    return (lang,) if lang else ()
+
+
+def linguist_effective(info: RepoInfo, mx: Matrices,
+                       framework_dirs: tuple[str, ...]) -> tuple[dict, dict, dict]:
+    """Linguist languages (aliases folded) with bytes Linguist cannot know
+    to ignore taken out: build-tool configs (webpack.config.js, ...) and
+    framework platform scaffolding. Linguist already drops vendored and
+    generated paths, so only non-vendored files are subtracted.
+
+    Returns (effective_bytes, excluded_bytes, dropped). A language is
+    dropped outright when every file of it in the tree is excluded; that is
+    robust to byte-count drift between Linguist and the tree API. Truncated
+    trees only get the byte subtraction (absence is not provable)."""
+    folded: dict[str, int] = {}
+    for lang, b in info.languages.items():
+        canon = mx.language_aliases.get(lang, lang)
+        folded[canon] = folded.get(canon, 0) + int(b or 0)
+
+    excluded: dict[str, int] = {}
+    total_files: dict[str, int] = {}
+    excluded_files: dict[str, int] = {}
+    for p in info.paths:
+        lp = p.lower()
+        if not is_scannable_path(lp, mx):
+            continue  # vendored/generated: Linguist never counted it
+        base = lp.rsplit("/", 1)[-1]
+        langs = _ext_languages(base, mx)
+        if not langs:
+            continue
+        is_excluded = (base in mx.tooling_config_basenames
+                       or bool(framework_dirs and lp.startswith(framework_dirs)))
+        size = info.sizes.get(p) or 0
+        for lang in langs:
+            total_files[lang] = total_files.get(lang, 0) + 1
+            if is_excluded:
+                excluded_files[lang] = excluded_files.get(lang, 0) + 1
+                excluded[lang] = excluded.get(lang, 0) + size
+
+    dropped: dict[str, str] = {}
+    effective: dict[str, int] = {}
+    for lang, b in folded.items():
+        if (not info.tree_truncated and excluded_files.get(lang)
+                and excluded_files[lang] == total_files.get(lang)):
+            dropped[lang] = "only build-tool config or framework scaffolding files"
+            continue
+        effective[lang] = max(0, b - excluded.get(lang, 0))
+    return effective, excluded, dropped
 
 
 def languages_from_extensions(entries: list[tuple[str, str, int | None]],
@@ -912,81 +1301,105 @@ def languages_from_extensions(entries: list[tuple[str, str, int | None]],
                            if b >= mx.min_language_bytes}
 
 
+def _group_matches(base: str, gnames: set, gsuffixes: tuple) -> bool:
+    if base in gnames or (gsuffixes and base.endswith(gsuffixes)):
+        return True
+    # requirements-dev.txt, dev-requirements.txt, requirements_test.txt
+    return ("requirements.txt" in gnames and "requirements" in base
+            and base.endswith(".txt"))
+
+
 def decide(info: RepoInfo, mx: Matrices,
            deep_iac_hits: list[str] | None = None,
            deep_dotnet_hit: str | None = None,
-           windows_signals: tuple[set, set, list] | None = None) -> ScanDecision:
+           windows_signals: tuple[set, set, list] | None = None,
+           iac_mode: str = "always",
+           windows_runner: str = "windows-latest") -> ScanDecision:
+    fw_dirs = framework_excluded_dirs(info.paths, mx)
     # Linguist languages below the byte threshold do not enable scans (a
     # 40-byte stub should not classify a repo); union with the extension scan
-    # to catch empty/lagging API responses. Vendored and generated paths are
-    # excluded from all file-based detection; the classification pass uses a
-    # stricter vendored list than the manifest/IaC/Windows passes.
-    langs = {l for l, b in info.languages.items()
-             if b >= mx.min_language_bytes}
-    class_entries = filtered_entries(info, mx, classification=True)
-    entries = filtered_entries(info, mx, classification=False)
+    # to catch empty/lagging API responses. Vendored, generated, tooling and
+    # framework-scaffolding paths are excluded from all file-based detection;
+    # the classification pass uses a stricter vendored list than the
+    # manifest/IaC/Windows passes.
+    effective, excluded_bytes, dropped = linguist_effective(info, mx, fw_dirs)
+    langs = {l for l, b in effective.items() if b >= mx.min_language_bytes}
+    class_entries = filtered_entries(info, mx, classification=True,
+                                     framework_dirs=fw_dirs)
+    entries = filtered_entries(info, mx, classification=False,
+                               framework_dirs=fw_dirs)
     ext_langs = languages_from_extensions(class_entries, mx)
     all_langs = langs | ext_langs
     has_submodules = any(p == ".gitmodules" for p in info.paths)
 
     # --- SAST (pipeline scan) ---
     sast_langs = all_langs & mx.sast_languages
+    # Build-system gate (C/C++): judged on all non-scaffolding paths,
+    # vendored included, so the gate itself fails open.
+    evidence_bases = {p.lower().rsplit("/", 1)[-1] for p in info.paths
+                      if not (fw_dirs and p.lower().startswith(fw_dirs))}
+    no_build = set()
+    if not info.tree_truncated:
+        for lang, (names, suffixes) in mx.sast_build_evidence.items():
+            if lang in sast_langs and not any(
+                    b in names or (suffixes and b.endswith(suffixes))
+                    for b in evidence_bases):
+                no_build.add(lang)
+    sast_langs -= no_build
     sast = bool(sast_langs)
     sast_forced_by_truncation = False
     if not sast and info.tree_truncated:
         # Fail open: a truncated tree plus an empty/lagging Linguist response
-        # is missing evidence, not evidence of absence. SCA already had this
-        # guard; SAST must too.
+        # is missing evidence, not evidence of absence.
         sast = True
         sast_forced_by_truncation = True
+    tier_hits = [(tier, sorted(all_langs & members))
+                 for tier, members in mx.sast_tiers if all_langs & members]
+    not_counted = [f"{l} ({tier})" for tier, ls in tier_hits for l in ls]
+    not_counted += [f"{l} (no build system)" for l in sorted(no_build)]
 
     # --- SCA (agent-based) ---
-    manifests = set()
+    manifests: set[str] = set()
     for _, base, _ in entries:
-        if base in mx.sca_manifest_names or base.endswith(mx.sca_manifest_suffixes):
+        if base in mx.sca_ignored_names:
+            continue
+        if base in mx.sca_manifest_names or base.endswith(mx.sca_manifest_suffixes) \
+                or ("requirements" in base and base.endswith(".txt")):
             manifests.add(base)
-        elif "requirements" in base and base.endswith(".txt"):
-            # requirements-dev.txt, dev-requirements.txt, requirements_test.txt
-            manifests.add(base)
-    # Binary dependency evidence implies its ecosystem even when no source
-    # of that language exists: a repo of vendored jars has no .java files,
-    # but the agent's jar hash scan is exactly what should run there.
-    # Without this, jar/dll-only repos incorrectly disabled SCA.
-    implied_ecosystems = set()
-    for b in manifests:
-        if b.endswith(".jar"):
-            implied_ecosystems.add("Java")
-        if b.endswith((".dll", ".nuspec")):
-            implied_ecosystems.add("C#")
-    implied_ecosystems &= mx.sca_languages
-    sca_langs = (all_langs & mx.sca_languages) | implied_ecosystems
-    # Require a supported ecosystem AND a resolvable manifest. An SCA agent run
-    # without a build system fails and blocks PRs, which is what we are avoiding.
-    sca = bool(sca_langs and manifests)
-    if not sca and info.tree_truncated and sca_langs:
+    enabling: set[str] = set()
+    supporting: set[str] = set()
+    unsupported: set[str] = set()
+    eco_hits: dict[str, set[str]] = {}
+    eco_languages: set[str] = set()
+    for b in sorted(manifests):
+        groups = [(g, gl) for g, gl, gn, gs in mx.sca_ecosystem_map
+                  if (gl & mx.sca_languages) and _group_matches(b, gn, gs)]
+        if not groups:
+            unsupported.add(b)
+            continue
+        is_supporting = b in mx.sca_supporting_names or (
+            mx.sca_supporting_suffixes and b.endswith(mx.sca_supporting_suffixes))
+        (supporting if is_supporting else enabling).add(b)
+        if not is_supporting:
+            for g, gl in groups:
+                eco_hits.setdefault(g, set()).add(b)
+                eco_languages |= gl & mx.sca_languages
+    # SCA needs a resolvable manifest from an ecosystem the integration
+    # scans. The ecosystem comes from the manifest itself (requirements.txt
+    # means pip even when Linguist only reports "Jupyter Notebook"); an
+    # agent run with only a Makefile/Gemfile/global.json fails with "no
+    # build system found" and, with break_build_on_error, blocks the PR.
+    sca = bool(enabling)
+    source_eco_langs = all_langs & mx.sca_languages
+    sca_forced_by_truncation = False
+    if not sca and info.tree_truncated and source_eco_langs:
         sca = True  # cannot prove absence of manifests, stay enabled
-
-    # Manifest <-> language pairing. Purely an explainability/confidence
-    # annotation: unpaired combinations (a stray pom.xml in a Python repo)
-    # stay enabled because the manifest is still a real dependency tree,
-    # but the report should distinguish a confident pairing from fail-open.
-    paired_ecosystems = []
-    for group, glangs, gnames, gsuffixes in mx.sca_ecosystem_map:
-        group_manifests = {b for b in manifests
-                           if b in gnames or (gsuffixes and b.endswith(gsuffixes))}
-        if group == "python":
-            group_manifests |= {b for b in manifests
-                                if "requirements" in b and b.endswith(".txt")}
-        if group_manifests and ((all_langs | implied_ecosystems) & glangs):
-            paired_ecosystems.append(group)
+        sca_forced_by_truncation = True
+    paired = sorted(g for g, gl, _, _ in mx.sca_ecosystem_map
+                    if g in eco_hits and gl & all_langs)
+    unpaired = sorted(set(eco_hits) - set(paired))
 
     # --- IaC / container / secrets ---
-    # Default: ON. The integration's IaC/secrets scan does secret detection
-    # and runs on the repo contents with low failure risk. It is valuable
-    # everywhere even without explicit IaC/container artifacts, so default
-    # to enabled. Disable via --no-iac (sets both to false) if a specific
-    # repo should never scan infrastructure (rare).
-    iac = True
     iac_artifacts = set()
     for lp, base, _ in entries:
         if base in mx.iac_file_names or base.endswith(mx.iac_file_suffixes) \
@@ -998,9 +1411,25 @@ def decide(info: RepoInfo, mx: Matrices,
         iac_artifacts.add(f"languages:{sorted(all_langs & mx.iac_languages)}")
     if deep_iac_hits:
         iac_artifacts.update(deep_iac_hits)
-    iac_reason = ("artifacts present" if iac_artifacts
-                  else "no artifacts detected, kept enabled for secret scanning")
-    if info.tree_truncated:
+    if iac_mode == "off":
+        iac = False
+        iac_reason = "disabled org-wide via --iac off"
+    elif iac_mode == "artifacts":
+        iac = bool(iac_artifacts) or info.tree_truncated
+        if iac_artifacts:
+            iac_reason = "artifacts present"
+        elif iac:
+            iac_reason = ("tree truncated, cannot prove absence of IaC "
+                          "artifacts, kept enabled")
+        else:
+            iac_reason = "no IaC/container artifacts detected (--iac artifacts)"
+    else:
+        # Default: ON everywhere. The scan also does secret detection on all
+        # repo contents with low failure risk.
+        iac = True
+        iac_reason = ("artifacts present" if iac_artifacts
+                      else "no artifacts detected, kept enabled for secret scanning")
+    if info.tree_truncated and "truncated" not in iac_reason:
         iac_reason += "; tree truncated"
 
     if sast_forced_by_truncation:
@@ -1008,20 +1437,27 @@ def decide(info: RepoInfo, mx: Matrices,
                        "cannot prove absence, kept enabled (fail-open)")
     elif sast:
         sast_reason = f"languages={sorted(sast_langs)}"
-    elif all_langs & mx.sast_not_autopackaged:
-        sast_reason = (f"disabled by config tier SAST_PIPELINE_NOT_AUTOPACKAGED: "
-                       f"{sorted(all_langs & mx.sast_not_autopackaged)}")
-    elif all_langs & mx.sast_compiled_only:
-        sast_reason = (f"disabled by config tier SAST_COMPILED_ONLY: "
-                       f"{sorted(all_langs & mx.sast_compiled_only)}")
+        if not_counted:
+            sast_reason += f"; not counted: {not_counted[:6]}"
     else:
-        sast_reason = f"no supported language (found: {sorted(all_langs)[:8]})"
+        parts = [f"{tier} {ls} ({SAST_TIER_EXPLANATIONS.get(tier, '')})"
+                 for tier, ls in tier_hits]
+        if no_build:
+            parts.append(f"{sorted(no_build)} without a build system "
+                         f"(Makefile/CMake/Meson/Ninja/vcxproj)")
+        if parts:
+            sast_reason = "disabled: " + "; ".join(parts)
+        else:
+            sast_reason = f"no supported language (found: {sorted(all_langs)[:8]})"
         if has_submodules:
             sast_reason += ("; .gitmodules present, code may live in "
                             "submodules the integration cannot see")
+    if dropped:
+        sast_reason += f"; ignored Linguist languages {sorted(dropped)} (tooling/scaffolding only)"
 
-    # --- Runner (default: runs_on) ---
-    # Central default runner is ubuntu-latest. Windows is set only when:
+    # --- Runner ---
+    # Central default runner is ubuntu-latest. A Windows runner is set only
+    # when:
     #   1. a build-based scan (SAST/SCA) is enabled, AND
     #   2. a strong signal or confirmed project-file marker is present, AND
     #   3. the repo shows .NET/C++ corroboration (language evidence or
@@ -1038,7 +1474,7 @@ def decide(info: RepoInfo, mx: Matrices,
                         or project_files or deep_dotnet_hit)
     if deep_dotnet_hit:
         strong_hits.add(f"project-marker:{deep_dotnet_hit}")
-    runner = ("windows-latest"
+    runner = (windows_runner
               if (strong_hits and (sast or sca) and corroborated) else None)
     if runner:
         runner_reason = f"windows signals={sorted(strong_hits)[:5]}"
@@ -1055,21 +1491,23 @@ def decide(info: RepoInfo, mx: Matrices,
     if info.tree_truncated:
         runner_reason += "; tree truncated, runner detection best-effort"
 
-    if sca_langs and manifests:
-        sca_reason = (f"manifests={sorted(manifests)[:6]}, "
-                      f"ecosystems={sorted(sca_langs)}")
-        if paired_ecosystems:
-            sca_reason += f"; paired={sorted(paired_ecosystems)}"
-        else:
-            sca_reason += ("; manifests not paired with detected languages "
-                           "(possible stray manifest), kept enabled fail-open")
-        if implied_ecosystems:
-            sca_reason += (f" (implied from binary deps: "
-                           f"{sorted(implied_ecosystems)})")
+    if sca_forced_by_truncation:
+        sca_reason = ("tree truncated, ecosystem language present, cannot "
+                      "prove absence of manifests, kept enabled")
     elif sca:
-        sca_reason = "tree truncated, ecosystem present, kept enabled"
+        sca_reason = (f"manifests={sorted(enabling)[:6]}, "
+                      f"ecosystems={sorted(eco_hits)}")
+        if paired:
+            sca_reason += f"; paired={paired}"
+        if unpaired:
+            sca_reason += (f"; manifest-only (no matching source language) "
+                           f"for {unpaired}, kept enabled fail-open")
     else:
-        sca_reason = "no supported ecosystem+manifest pair"
+        found = sorted(unsupported | supporting)
+        sca_reason = "no integration-supported dependency manifest"
+        if found:
+            sca_reason += (f" (found only {found[:6]}: not resolvable by the "
+                           f"integration's SCA scan on their own)")
 
     # Sanitize every reason: basenames/paths embedded here end up inside
     # veracode.yml comments, PR bodies, and logs. Filenames may contain
@@ -1082,11 +1520,19 @@ def decide(info: RepoInfo, mx: Matrices,
     }.items()}
     evidence = {
         "linguist_languages": sorted(langs),
+        "linguist_dropped": dropped,
+        "linguist_excluded_bytes": excluded_bytes,
+        "framework_dirs_excluded": list(fw_dirs),
         "extension_languages": sorted(ext_langs),
         "all_languages": sorted(all_langs),
+        "sast_not_counted": not_counted,
         "manifests": sorted(manifests),
-        "implied_ecosystems": sorted(implied_ecosystems),
-        "paired_ecosystems": sorted(paired_ecosystems),
+        "sca_enabling_manifests": sorted(enabling),
+        "sca_supporting_manifests": sorted(supporting),
+        "sca_unsupported_manifests": sorted(unsupported),
+        "sca_ecosystems": sorted(eco_hits),
+        "sca_ecosystem_languages": sorted(eco_languages),
+        "paired_ecosystems": paired,
         "iac_artifacts": sorted(iac_artifacts),
         "windows_strong": sorted(strong_hits),
         "windows_weak": sorted(weak_hits),
@@ -1112,7 +1558,8 @@ def ambiguous_root_yaml(info: RepoInfo, mx: Matrices) -> list[str]:
         if base in mx.iac_file_names or base.startswith(mx.iac_name_prefixes):
             continue
         if base in ("package.json", "composer.json", "cdk.json", "tsconfig.json",
-                    "package-lock.json", ".eslintrc.json"):
+                    "package-lock.json", ".eslintrc.json", "veracode.yml",
+                    "pubspec.yaml"):
             continue
         out.append(p)
     return out
@@ -1122,31 +1569,52 @@ def ambiguous_root_yaml(info: RepoInfo, mx: Matrices) -> list[str]:
 # veracode.yml generation (minimal overrides only)
 # ---------------------------------------------------------------------------
 
-def build_override_yaml(decision: ScanDecision,
-                        platform_analysis: str | None) -> str | None:
+def build_override_yaml(decision: ScanDecision, platform_analysis: str | None,
+                        runner_scope: str = "build",
+                        disable_issue_triggers: bool = True) -> str | None:
     """Return repo-level veracode.yml content, or None if no override needed.
 
-    Only disabled sections (and, when detected, a Windows runner default) are
+    Only disabled sections (and, when detected, a Windows runner) are
     written; everything else inherits the central veracode repo config.
     Disabling static triggers only stops PIPELINE scans; platform
     sandbox/policy scans follow analysis_on_platform, written only when
     --platform-analysis is passed.
+
+    runner_scope "build" writes the documented per-scan build runner
+    (actions: <scan>: build: runs_on) for the enabled build-based scans, so
+    only the build moves to Windows. "all" writes default: runs_on, which
+    in the integration's workflows moves every job (check run, cleanup, SCA,
+    IaC/secrets) onto the Windows runner.
     """
     parts = [
+        f"{MANAGED_MARKER} (settings below are regenerated; edit the tool's "
+        f"--config instead)",
         f"# Detection: SAST={decision.sast} ({decision.reasons['sast']})",
         f"#            SCA={decision.sca} ({decision.reasons['sca']})",
         f"#            IaC={decision.iac} ({decision.reasons['iac']})",
-        f"#            Runner={decision.runner or 'default'} "
+        f"#            Runner={decision.runner or 'default'}"
+        f"{' (' + runner_scope + ' scope)' if decision.runner else ''} "
         f"({decision.reasons.get('runner', '')})",
         "",
     ]
     wrote_section = False
     if decision.runner:
-        parts.append(f"default:\n  runs_on: {decision.runner}\n")
+        if not RUNNER_LABEL_RE.match(decision.runner):
+            raise ValueError(f"unsafe runner label {decision.runner!r}")
+        if runner_scope == "all":
+            parts.append(f"default:\n  runs_on: {decision.runner}\n")
+        else:
+            block = ["actions:"]
+            for kind in ("sast", "sca"):
+                if getattr(decision, kind):
+                    block.append(f"  {SECTION_KEYS[kind]}:\n    build:\n"
+                                 f"      runs_on: {decision.runner}")
+            parts.append("\n".join(block) + "\n")
         wrote_section = True
     for kind, key in SECTION_KEYS.items():
         if not getattr(decision, kind):
-            parts.append(DISABLE_BLOCK.format(key=key))
+            parts.append(DISABLE_BLOCK.format(key=key)
+                         + (ISSUES_DISABLE if disable_issue_triggers else ""))
             wrote_section = True
         elif kind == "sast" and platform_analysis is not None:
             parts.append(f"{key}:\n  analysis_on_platform: {platform_analysis}\n")
@@ -1163,17 +1631,53 @@ def git_blob_sha(content: str) -> str:
 # Delivery: commit / PR
 # ---------------------------------------------------------------------------
 
-def create_branch(gh: GhClient, org: str, repo: str, base: str, new: str) -> bool:
-    head = gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{quote(base, safe='')}"],
+def _ref_path(branch: str) -> str:
+    # Slashes stay literal: GitHub ref endpoints take "heads/feature/x".
+    return quote(branch, safe="/")
+
+
+def get_ref_sha(gh: GhClient, org: str, repo: str, branch: str) -> str | None:
+    data = gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{_ref_path(branch)}"],
                    ok_statuses=(404,))
-    if not head:
+    if isinstance(data, dict):
+        return (data.get("object") or {}).get("sha")
+    return None
+
+
+def ensure_branch(gh: GhClient, org: str, repo: str, base: str, new: str,
+                  reset_stale: bool) -> bool:
+    """Create the scoping branch from the default branch head, or reuse it.
+
+    reset_stale: the branch exists but no open PR uses it (left over from a
+    merged or closed PR). It is moved to the current default head so the new
+    PR has a clean, conflict-free diff instead of carrying old commits."""
+    base_sha = get_ref_sha(gh, org, repo, base)
+    if not base_sha:
         log.error("[%s] cannot resolve head of %s", repo, base)
         return False
-    if gh.json(["api", f"repos/{org}/{repo}/git/ref/heads/{quote(new, safe='')}"], ok_statuses=(404,)):
-        log.info("[%s] branch %s already exists, reusing", repo, new)
+    current = get_ref_sha(gh, org, repo, new)
+    if current:
+        if reset_stale and current != base_sha:
+            gh.run(["api", "-X", "PATCH",
+                    f"repos/{org}/{repo}/git/refs/heads/{_ref_path(new)}",
+                    "-f", f"sha={base_sha}", "-F", "force=true"])
+            log.info("[%s] reset stale branch %s to %s head", repo, new, base)
+        else:
+            log.info("[%s] branch %s already exists, reusing", repo, new)
         return True
-    gh.run(["api", "-X", "POST", f"repos/{org}/{repo}/git/refs",
-            "-f", f"ref=refs/heads/{new}", "-f", f"sha={head['object']['sha']}"])
+    try:
+        gh.run(["api", "-X", "POST", f"repos/{org}/{repo}/git/refs",
+                "-f", f"ref=refs/heads/{new}", "-f", f"sha={base_sha}"])
+    except GhError as e:
+        # A POST that succeeded server-side but timed out or returned 5xx
+        # client-side is retried, and the retry gets 422 "Reference already
+        # exists". That is success, not a failed repo.
+        s = e.stderr.lower()
+        if re.search(r"\bhttp 422\b", s) and "already exists" in s \
+                and get_ref_sha(gh, org, repo, new):
+            log.info("[%s] branch %s was created by an earlier attempt", repo, new)
+            return True
+        raise
     return True
 
 
@@ -1214,70 +1718,137 @@ def put_file(gh: GhClient, org: str, repo: str, branch: str, content: str,
         raise
 
 
-def open_pr(gh: GhClient, org: str, repo: str, base: str, head: str,
-            decision: ScanDecision) -> str:
-    existing = gh.run(["pr", "list", "-R", f"{org}/{repo}", "--head", head,
-                       "--state", "open", "--json", "url", "--jq", ".[0].url"])
-    if existing.strip():
-        return existing.strip()
+def delete_file(gh: GhClient, org: str, repo: str, branch: str,
+                existing_sha: str | None, message: str) -> None:
+    """Remove the tool-managed veracode.yml so the central config applies."""
+    if not existing_sha:
+        log.info("[%s] %s has no veracode.yml, nothing to delete", repo, branch)
+        return
+    try:
+        gh.run(["api", "-X", "DELETE", f"repos/{org}/{repo}/contents/veracode.yml",
+                "-f", f"message={message}", "-f", f"sha={existing_sha}",
+                "-f", f"branch={branch}"])
+    except GhError as e:
+        # Retried after a server-side success: the file is already gone.
+        if re.search(r"\bhttp (404|409|422)\b", e.stderr.lower()) \
+                and get_file_sha_on_ref(gh, org, repo, branch) is None:
+            log.info("[%s] veracode.yml already removed on %s", repo, branch)
+            return
+        raise
+
+
+def find_pr(gh: GhClient, org: str, repo: str, head: str, open_only: bool) -> str | None:
+    """URL of the newest PR from `head`: open ones, or closed/merged ones."""
+    if open_only:
+        jq = ".[0].url // empty"
+        state = "open"
+    else:
+        jq = '[.[] | select(.state != "OPEN")][0].url // empty'
+        state = "all"
+    out = gh.run(["pr", "list", "-R", f"{org}/{repo}", "--head", head,
+                  "--state", state, "--json", "url,state", "--jq", jq])
+    return out.strip() or None
+
+
+def _md(s: str) -> str:
+    """Render repo-derived text as inline code in PR bodies, so file names
+    cannot @mention people, link issues, or inject markdown."""
+    return "`" + s.replace("`", "'") + "`"
+
+
+def create_pr(gh: GhClient, org: str, repo: str, base: str, head: str,
+              decision: ScanDecision, action: str, runner_scope: str) -> str:
+    if action == "delete":
+        intro = ("Automated Veracode scan scoping: every scan type is relevant "
+                 "for this repository now, so the tool-managed `veracode.yml` "
+                 "is removed and the central configuration applies again.")
+    else:
+        intro = "Automated Veracode scan scoping."
     body = (
-        "Automated Veracode scan scoping.\n\n"
+        intro + "\n\n"
         + "\n".join(
             f"- **{k.upper()}**: {'enabled' if getattr(decision, k) else 'disabled'}"
-            f" ({decision.reasons[k]})" for k in SECTION_KEYS)
+            f" {_md(decision.reasons[k])}" for k in SECTION_KEYS)
         + f"\n- **Runner**: {decision.runner or 'central default'}"
-          f" ({decision.reasons.get('runner', '')})"
+          f"{' (' + runner_scope + ' scope)' if decision.runner else ''}"
+          f" {_md(decision.reasons.get('runner', ''))}"
         + "\n\nNote: static push/pr triggers only control pipeline scans. Platform "
           "sandbox/policy scans are governed by analysis_on_platform and are "
           "not changed by this file unless explicitly set."
     )
+    title = ("Remove Veracode scan scoping override" if action == "delete"
+             else "Scope Veracode scans to relevant scan types")
     try:
         out = gh.run(["pr", "create", "-R", f"{org}/{repo}", "--base", base,
-                      "--head", head,
-                      "--title", "Scope Veracode scans to relevant scan types",
-                      "--body", body])
+                      "--head", head, "--title", title, "--body", body])
         return out.strip()
     except GhError as e:
         # A create that succeeded server-side but was retried after a
         # timeout fails with "already exists". Recover the URL instead of
         # marking the repo failed.
         if "already exists" in e.stderr.lower():
-            existing = gh.run(["pr", "list", "-R", f"{org}/{repo}",
-                               "--head", head, "--state", "open",
-                               "--json", "url", "--jq", ".[0].url"])
-            if existing.strip():
-                return existing.strip()
+            url = find_pr(gh, org, repo, head, open_only=True)
+            if url:
+                return url
         raise
+
+
+def close_stale_pr(gh: GhClient, org: str, repo: str, url: str) -> None:
+    gh.run(["pr", "close", url, "-R", f"{org}/{repo}", "--comment",
+            "Closed by veracode-scan-scoping: a fresh scan of the default branch "
+            "shows every scan type is relevant, so no override is needed."])
+
+
+def search_open_scoping_prs(gh: GhClient, org: str, head: str) -> set[str] | None:
+    """Repo names (lowercase) with an open PR from the scoping branch, in one
+    search query instead of one call per repo. None when search fails; the
+    stale-PR cleanup is then skipped (best effort, never fatal)."""
+    try:
+        out = gh.run(["api", "-X", "GET", "--paginate", "search/issues",
+                      "-f", f"q=org:{org} is:pr is:open head:{head}",
+                      "-f", "per_page=100", "--jq", ".items[].repository_url"])
+    except GhError as e:
+        log.warning("Stale-PR search failed, skipping cleanup of outdated "
+                    "scoping PRs: %s", e.stderr.strip()[:150])
+        return None
+    return {line.rstrip("/").rsplit("/", 1)[-1].lower()
+            for line in out.splitlines() if line.strip()}
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+TERMINAL_OUTCOMES = {"no_change", "already_correct", "committed", "pr_opened",
+                     "skipped_existing_file", "pr_declined"}
+
+
 def write_csv_report(path: str, report: list[dict]) -> None:
     """Flatten the per-repo report list into a CSV: one row per repo, scan
     decisions and reasons as columns, easy to open in Excel/Sheets for
     client review of a dry run before anything is written to GitHub."""
     fieldnames = [
-        "repo", "default_branch", "tree_truncated", "outcome",
-        "override_written",
+        "repo", "default_branch", "tree_truncated", "outcome", "action",
+        "existing_file", "override_written",
         "sast", "sast_reason",
         "sca", "sca_reason",
         "iac", "iac_reason",
         "runner", "runner_reason",
-        "languages", "pr_url",
+        "languages", "pr_url", "error", "carried_over",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in report:
-            d = r.get("decision", {})
+            d = r.get("decision") or {}
             reasons = d.get("reasons", {})
             writer.writerow({
                 "repo": r.get("repo"),
                 "default_branch": r.get("default_branch"),
                 "tree_truncated": r.get("tree_truncated"),
                 "outcome": r.get("outcome"),
+                "action": r.get("action") or "",
+                "existing_file": r.get("existing_file") or "",
                 "override_written": r.get("override_written"),
                 "sast": d.get("sast"),
                 "sast_reason": reasons.get("sast"),
@@ -1285,10 +1856,12 @@ def write_csv_report(path: str, report: list[dict]) -> None:
                 "sca_reason": reasons.get("sca"),
                 "iac": d.get("iac"),
                 "iac_reason": reasons.get("iac"),
-                "runner": d.get("runner") or "default",
+                "runner": d.get("runner") or ("default" if d else ""),
                 "runner_reason": reasons.get("runner"),
-                "languages": ", ".join(sorted(r.get("languages", {}).keys())),
+                "languages": ", ".join(sorted((r.get("languages") or {}).keys())),
                 "pr_url": r.get("pr_url", ""),
+                "error": r.get("error", ""),
+                "carried_over": r.get("carried_over", False),
             })
 
 
@@ -1298,7 +1871,7 @@ def matches_any(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(name.lower(), p.lower()) for p in patterns)
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--org", required=True, help="GitHub organization")
@@ -1307,46 +1880,71 @@ def main() -> int:
     ap.add_argument("--direct-commit", action="store_true",
                     help="Commit to the default branch instead of opening a PR")
     ap.add_argument("--branch-name", default="chore/veracode-scan-scoping")
-    ap.add_argument("--include", nargs="*", default=["*"],
+    ap.add_argument("--include", nargs="+", default=["*"],
                     help="Glob patterns of repos to include")
     ap.add_argument("--exclude", nargs="*", default=["veracode"],
-                    help="Glob patterns to skip (central 'veracode' repo by default)")
+                    help="Glob patterns to skip (central 'veracode' repo is "
+                         "always excluded)")
     ap.add_argument("--include-archived", action="store_true")
     ap.add_argument("--include-forks", action="store_true")
     ap.add_argument("--force", action="store_true",
-                    help="Overwrite an existing repo-level veracode.yml")
+                    help="Overwrite a hand-written (unmanaged) veracode.yml. "
+                         "Files generated by this tool are updated without it.")
+    ap.add_argument("--reopen-declined", action="store_true",
+                    help="Open a new PR even where a previous scoping PR was "
+                         "closed and the default branch has no managed file "
+                         "(treated as declined by the repo owners otherwise)")
+    ap.add_argument("--keep-issue-triggers", action="store_true",
+                    help="Do not write 'issues: trigger: false' for disabled "
+                         "scans. Use when the central config never enables issue "
+                         "triggers and files from an earlier version of this "
+                         "tool should not get a one-time update PR.")
+    ap.add_argument("--iac", choices=["always", "artifacts", "off"], default="always",
+                    help="always (default): keep the IaC/secrets scan on for every "
+                         "repo (secret detection is useful everywhere). "
+                         "artifacts: disable it where no IaC/container artifacts "
+                         "are found. off: disable it org-wide.")
     ap.add_argument("--no-iac", action="store_true",
-                    help="Disable the IaC/secrets scan for all repos. By default "
-                         "IaC is enabled for secret detection even without IaC "
-                         "artifacts.")
+                    help="Deprecated alias for --iac off")
     ap.add_argument("--deep-iac", action="store_true",
-                    help="Download a few ambiguous root YAML/JSON files to confirm "
-                         "CloudFormation/Kubernetes content (extra API calls)")
+                    help="With --iac artifacts: download a few ambiguous root "
+                         "YAML/JSON files to confirm CloudFormation/Kubernetes "
+                         "content (extra API calls). Ignored otherwise.")
     ap.add_argument("--runner", choices=["auto", "off"], default="auto",
-                    help="auto (default): write 'default: runs_on: windows-latest' "
-                         "when Windows build signals are confirmed and a "
-                         "build-based scan is enabled. Weak signals (xaml, "
-                         "web.config, vbproj/fsproj) automatically trigger "
-                         "project-file inspection. off: never write runs_on.")
+                    help="auto (default): set a Windows runner when Windows "
+                         "build signals are confirmed and a build-based scan is "
+                         "enabled. Weak signals (xaml, web.config, "
+                         "vbproj/fsproj) automatically trigger project-file "
+                         "inspection. off: never write a runner.")
+    ap.add_argument("--runner-scope", choices=["build", "all"], default="build",
+                    help="build (default): write actions: <scan>: build: runs_on "
+                         "for the enabled SAST/SCA scans only. all: write "
+                         "default: runs_on, which moves every job (check run, "
+                         "cleanup, IaC/secrets) to Windows too.")
+    ap.add_argument("--windows-runner", default="windows-latest",
+                    help="Runner label written for Windows-bound builds "
+                         "(default windows-latest). Use your self-hosted label, "
+                         "or a flow list like '[self-hosted, windows]'.")
     ap.add_argument("--deep-dotnet", action="store_true",
                     help="Extend project-file inspection to every repo with "
                          ".csproj/.vbproj/.fsproj files, even without weak "
                          "surface signals. Catches SDK-style projects that "
                          "target net4x or *-windows TFMs (extra API calls, "
-                         "up to 5 per repo)")
+                         "up to --max-project-files per repo)")
     ap.add_argument("--platform-analysis", choices=["true", "false"], default=None,
                     help="Also pin analysis_on_platform for SAST-relevant repos. "
                          "Untouched by default.")
     ap.add_argument("--config", default=None,
-                    help="JSON file overriding detection matrices "
+                    help="JSON file overriding detection matrices. Use KEY to "
+                         "replace, +KEY to extend, -KEY to remove items "
                          "(keys: " + ", ".join(sorted(DEFAULT_MATRICES)) + ")")
     ap.add_argument("--report", default=None, help="Write a JSON audit report here")
     ap.add_argument("--resume-from", default=None,
                     help="Path to a prior --report JSON. Repos with terminal "
-                         "outcomes there (no_change, already_correct, "
-                         "committed, pr_opened, skipped_existing_file) are "
-                         "skipped; failed and dry-run outcomes are retried. "
-                         "The new report contains only newly processed repos.")
+                         "outcomes there (" + ", ".join(sorted(TERMINAL_OUTCOMES))
+                         + ") are skipped and their entries carried into the "
+                         "new report, so chained resumes stay cumulative. "
+                         "Failed and dry-run outcomes are retried.")
     ap.add_argument("--no-graphql", action="store_true",
                     help="Disable batched GraphQL language prefetching and "
                          "use one REST call per repo instead")
@@ -1363,15 +1961,39 @@ def main() -> int:
                     help="Minimum seconds between GitHub API calls (default 0.25)")
     ap.add_argument("--min-remaining", type=int, default=100,
                     help="Sleep until reset when core rate limit drops below this")
+    ap.add_argument("--write-interval", type=float, default=1.0,
+                    help="Minimum seconds between write requests (commits, "
+                         "branches, PRs). Default 1.0 keeps under GitHub's "
+                         "~80 content-creating requests/minute.")
+    ap.add_argument("--max-writes-per-hour", type=int, default=450,
+                    help="Rolling hourly cap on write requests (default 450, "
+                         "under GitHub's ~500/hour secondary limit). 0 disables.")
+    ap.add_argument("--gh-timeout", type=float, default=120.0,
+                    help="Seconds before a single gh call is abandoned and "
+                         "retried (default 120)")
     ap.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
 
-    if not os.environ.get("GITHUB_TOKEN"):
-        log.error("GITHUB_TOKEN environment variable not set. Required scopes: "
-                  "repo, workflow, read:org (under admin:org)")
+    iac_mode = "off" if args.no_iac else args.iac
+    if args.no_iac and args.iac not in ("always", "off"):
+        log.error("--no-iac conflicts with --iac %s", args.iac)
+        return 2
+    if args.deep_iac and iac_mode != "artifacts":
+        log.warning("--deep-iac only affects --iac artifacts; ignoring it "
+                    "(no extra API calls will be made).")
+    if not RUNNER_LABEL_RE.match(args.windows_runner):
+        log.error("--windows-runner %r is not a valid runner label or flow list",
+                  args.windows_runner)
+        return 2
+    if args.max_project_files < 1 or args.gh_timeout <= 0:
+        log.error("--max-project-files must be >= 1 and --gh-timeout > 0")
         return 2
 
     overrides = None
@@ -1392,31 +2014,52 @@ def main() -> int:
     # even when the user supplies a custom --exclude list (which replaces
     # the default rather than extending it).
     excludes = list(args.exclude)
-    if not any(fnmatch.fnmatch("veracode", p) for p in excludes):
+    if not matches_any("veracode", excludes):
         excludes.append("veracode")
         log.info("Added central 'veracode' repo to excludes automatically.")
 
     resume_done: set[str] = set()
+    carried: list[dict] = []
     if args.resume_from:
-        terminal = {"no_change", "already_correct", "committed",
-                    "pr_opened", "skipped_existing_file"}
         try:
             with open(args.resume_from) as f:
                 prior = json.load(f)
-            resume_done = {r.get("repo") for r in prior.get("repos", [])
-                           if isinstance(r, dict) and r.get("outcome") in terminal}
-            resume_done.discard(None)
+            for r in prior.get("repos", []):
+                if isinstance(r, dict) and r.get("repo") \
+                        and r.get("outcome") in TERMINAL_OUTCOMES \
+                        and r["repo"] not in resume_done:
+                    resume_done.add(r["repo"])
+                    carried.append(dict(r, carried_over=True))
             log.info("Resume: %d repos with terminal outcomes in %s will be "
-                     "skipped", len(resume_done), args.resume_from)
+                     "skipped and carried into the new report",
+                     len(resume_done), args.resume_from)
         except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
             log.error("Cannot read --resume-from %s: %s", args.resume_from, e)
             return 2
 
-    gh = GhClient(min_interval=args.min_interval, min_remaining=args.min_remaining)
+    gh = GhClient(min_interval=args.min_interval, min_remaining=args.min_remaining,
+                  timeout=args.gh_timeout, write_interval=args.write_interval,
+                  writes_per_hour=args.max_writes_per_hour)
+    # Authentication is whatever gh resolves: GH_TOKEN, then GITHUB_TOKEN,
+    # then stored `gh auth login` credentials (GH_ENTERPRISE_TOKEN/GH_HOST
+    # for GHES). Checking one env var here gave false assurance when
+    # another token took precedence.
+    token_source = ("GH_TOKEN" if os.environ.get("GH_TOKEN") else
+                    "GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else
+                    "gh stored credentials")
     try:
         gh.run(["auth", "status"])
     except (GhError, FileNotFoundError) as e:
-        log.error("gh CLI not available or not authenticated: %s", e)
+        log.error("gh CLI not available or not authenticated (%s): %s",
+                  token_source, e)
+        return 2
+    log.info("Authenticated via %s", token_source)
+    try:
+        gh.run(["api", f"orgs/{args.org}", "--jq", ".login"])
+    except GhError as e:
+        log.error("Cannot access org %s with this token (check the org name, "
+                  "token scopes repo + read:org, and SAML SSO authorization): %s",
+                  args.org, e.stderr.strip()[:200])
         return 2
 
     try:
@@ -1426,7 +2069,8 @@ def main() -> int:
         return 2
     summary = {"scoped": [], "no_change": [], "unchanged_identical": [],
                "skipped": [], "failed": []}
-    report: list[dict] = []
+    report: list[dict] = list(carried)
+    interrupted = False
 
     def flush_reports() -> None:
         """Write JSON/CSV reports. Called from a finally block so an
@@ -1439,6 +2083,7 @@ def main() -> int:
                                "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                           time.gmtime()),
                                "api_calls": gh.api_calls,
+                               "write_calls": gh.write_calls,
                                "interrupted": interrupted,
                                "repos": report}, f, indent=2)
                 log.info("Audit report written to %s", args.report)
@@ -1473,19 +2118,26 @@ def main() -> int:
         todo.append(repo)
     log.info("%d of %d repos to process after filtering", len(todo), len(repos))
 
-    prefetched_languages: dict[str, dict[str, int]] = {}
-    if todo and not args.no_graphql:
-        prefetched_languages = batch_fetch_languages(
-            gh, args.org, [r["name"] for r in todo])
-        log.info("Prefetched languages for %d/%d repos via GraphQL "
-                 "(any missing fall back to per-repo REST)",
-                 len(prefetched_languages), len(todo))
-
-    interrupted = False
     try:
+        prefetched_languages: dict[str, dict[str, int]] = {}
+        if todo and not args.no_graphql:
+            prefetched_languages = batch_fetch_languages(
+                gh, args.org, [r["name"] for r in todo])
+            log.info("Prefetched languages for %d/%d repos via GraphQL "
+                     "(any missing fall back to per-repo REST)",
+                     len(prefetched_languages), len(todo))
+
+        # Open scoping PRs that a fresh scan no longer justifies (the repo
+        # gained code while the PR sat unmerged) are closed, so a stale
+        # "disable SAST" proposal cannot be merged later. PR mode only.
+        stale_pr_repos: set[str] | None = set()
+        if todo and not args.direct_commit:
+            stale_pr_repos = search_open_scoping_prs(gh, args.org, args.branch_name)
+
         for idx, repo in enumerate(todo, 1):
             name = repo["name"]
             log.info("[%d/%d] %s", idx, len(todo), name)
+            report_entry: dict | None = None
 
             try:
                 info = inspect_repo(gh, args.org, repo, prefetched_languages)
@@ -1493,7 +2145,7 @@ def main() -> int:
                     summary["skipped"].append((name, "no readable content")); continue
 
                 deep_hits = None
-                if args.deep_iac:
+                if args.deep_iac and iac_mode == "artifacts":
                     cands = ambiguous_root_yaml(info, mx)
                     if cands:
                         deep_hits = deep_iac_confirm(gh, args.org, name,
@@ -1514,20 +2166,18 @@ def main() -> int:
                                                        proj_files, mx,
                                                        max_files=args.max_project_files)
 
-                decision = decide(info, mx, deep_hits, dotnet_hit, win_signals)
-                # When a CLI flag overrides a decision, the reason must follow:
-                # a committed header saying "IaC=False (kept enabled for secret
-                # scanning)" contradicts itself and poisons the audit trail.
-                if args.no_iac:
-                    decision.iac = False
-                    decision.reasons["iac"] = "disabled org-wide via --no-iac"
+                decision = decide(info, mx, deep_hits, dotnet_hit, win_signals,
+                                  iac_mode=iac_mode,
+                                  windows_runner=args.windows_runner)
                 if args.runner == "off":
                     if decision.runner:
                         decision.reasons["runner"] = ("windows signals detected "
                                                       "but runner selection "
                                                       "disabled via --runner off")
                     decision.runner = None
-                content = build_override_yaml(decision, args.platform_analysis)
+                content = build_override_yaml(
+                    decision, args.platform_analysis, args.runner_scope,
+                    disable_issue_triggers=not args.keep_issue_triggers)
 
                 log.info("[%s] SAST=%s SCA=%s IaC=%s runner=%s", name,
                          decision.sast, decision.sca, decision.iac,
@@ -1539,59 +2189,146 @@ def main() -> int:
                                 "languages": info.languages,
                                 "tree_truncated": info.tree_truncated,
                                 "decision": asdict(decision),
+                                "runner_scope": args.runner_scope,
                                 "override_written": content is not None,
+                                "existing_file": None,
+                                "action": None,
                                 "outcome": None}
                 report.append(report_entry)
 
-                if content is None:
-                    summary["no_change"].append(name)
-                    report_entry["outcome"] = "no_change"
-                    log.info("[%s] all default scans relevant, no override needed", name)
-                    continue
-
+                # --- Existing file: managed (ours) or hand-written? ---
+                existing_text = None
+                existing_managed = False
                 if info.existing_veracode_sha:
-                    if git_blob_sha(content) == info.existing_veracode_sha:
+                    if content is not None and \
+                            git_blob_sha(content) == info.existing_veracode_sha:
+                        report_entry["existing_file"] = "managed"
                         summary["unchanged_identical"].append(name)
                         report_entry["outcome"] = "already_correct"
                         log.info("[%s] existing veracode.yml already matches, skipping", name)
                         continue
-                    if not args.force:
-                        summary["skipped"].append(
-                            (name, "veracode.yml exists with different content (use --force)"))
-                        report_entry["outcome"] = "skipped_existing_file"
+                    existing_text = fetch_blob_text(gh, args.org, name,
+                                                    info.existing_veracode_sha)
+                    existing_managed = existing_text is not None and is_managed(existing_text)
+                    report_entry["existing_file"] = ("managed" if existing_managed
+                                                     else "unmanaged")
+
+                action = None
+                if content is None:
+                    if existing_managed:
+                        action = "delete"
+                    else:
+                        note = ("all default scans relevant, no override needed"
+                                + ("; hand-written veracode.yml left untouched"
+                                   if info.existing_veracode_sha else ""))
+                        report_entry["outcome"] = "no_change"
+                        summary["no_change"].append(name)
+                        log.info("[%s] %s", name, note)
+                        if stale_pr_repos and name.lower() in stale_pr_repos:
+                            url = find_pr(gh, args.org, name, args.branch_name,
+                                          open_only=True)
+                            if url:
+                                report_entry["stale_pr"] = url
+                                if args.dry_run:
+                                    log.info("[%s] would close outdated scoping PR %s",
+                                             name, url)
+                                else:
+                                    close_stale_pr(gh, args.org, name, url)
+                                    log.info("[%s] closed outdated scoping PR %s",
+                                             name, url)
                         continue
+                else:
+                    if info.existing_veracode_sha:
+                        if existing_text is not None and \
+                                yaml_body(existing_text) == yaml_body(content):
+                            # Same settings, only the reason header differs
+                            # (a file list or truncation note changed). No
+                            # churn, no --force needed.
+                            summary["unchanged_identical"].append(name)
+                            report_entry["outcome"] = "already_correct"
+                            log.info("[%s] existing veracode.yml has identical "
+                                     "settings, skipping", name)
+                            continue
+                        if not existing_managed and not args.force:
+                            summary["skipped"].append(
+                                (name, "hand-written veracode.yml with different "
+                                       "settings (review, or use --force)"))
+                            report_entry["outcome"] = "skipped_existing_file"
+                            continue
+                        if not existing_managed:
+                            log.warning("[%s] --force: overwriting hand-written "
+                                        "veracode.yml", name)
+                    action = "write"
+                report_entry["action"] = action
 
                 if args.dry_run:
-                    print(f"\n===== {name} (dry run) =====\n{content}")
-                    summary["scoped"].append((name, "dry-run"))
-                    report_entry["outcome"] = "would_write"
+                    if action == "delete":
+                        print(f"\n===== {name} (dry run) =====\n"
+                              f"# would DELETE the managed veracode.yml: every "
+                              f"scan type is relevant now\n")
+                        report_entry["outcome"] = "would_delete"
+                    else:
+                        print(f"\n===== {name} (dry run) =====\n{content}")
+                        report_entry["outcome"] = "would_write"
+                    summary["scoped"].append((name, f"dry-run ({action})"))
                     continue
 
-                msg = "chore: scope Veracode scans to relevant scan types"
+                msg = ("chore: remove Veracode scan scoping override"
+                       if action == "delete" else
+                       "chore: scope Veracode scans to relevant scan types")
                 if args.direct_commit:
-                    put_file(gh, args.org, name, info.default_branch, content,
-                             info.existing_veracode_sha, msg)
-                    summary["scoped"].append((name, f"committed to {info.default_branch}"))
+                    if action == "delete":
+                        delete_file(gh, args.org, name, info.default_branch,
+                                    info.existing_veracode_sha, msg)
+                    else:
+                        put_file(gh, args.org, name, info.default_branch, content,
+                                 info.existing_veracode_sha, msg)
+                    summary["scoped"].append((name, f"committed ({action}) to "
+                                                    f"{info.default_branch}"))
                     report_entry["outcome"] = "committed"
-                else:
-                    if not create_branch(gh, args.org, name, info.default_branch,
-                                         args.branch_name):
-                        summary["failed"].append((name, "branch creation failed"))
-                        report_entry["outcome"] = "failed_branch_creation"
+                    continue
+
+                open_url = find_pr(gh, args.org, name, args.branch_name, open_only=True)
+                if not open_url and not existing_managed and not args.reopen_declined:
+                    closed_url = find_pr(gh, args.org, name, args.branch_name,
+                                         open_only=False)
+                    if closed_url:
+                        # A previous scoping PR was closed (or merged and the
+                        # file later removed) and the default branch carries
+                        # no managed file: the owners said no. Do not reopen
+                        # on every run.
+                        summary["skipped"].append(
+                            (name, f"previous scoping PR declined: {closed_url} "
+                                   f"(use --reopen-declined)"))
+                        report_entry["outcome"] = "pr_declined"
+                        report_entry["pr_url"] = closed_url
                         continue
-                    branch_sha = get_file_sha_on_ref(gh, args.org, name, args.branch_name)
-                    put_file(gh, args.org, name, args.branch_name, content, branch_sha, msg)
-                    url = open_pr(gh, args.org, name, info.default_branch,
-                                  args.branch_name, decision)
-                    summary["scoped"].append((name, url))
-                    report_entry["outcome"] = "pr_opened"
-                    report_entry["pr_url"] = url
+                if not ensure_branch(gh, args.org, name, info.default_branch,
+                                     args.branch_name, reset_stale=not open_url):
+                    summary["failed"].append((name, "branch creation failed"))
+                    report_entry["outcome"] = "failed_branch_creation"
+                    continue
+                branch_sha = get_file_sha_on_ref(gh, args.org, name, args.branch_name)
+                if action == "delete":
+                    delete_file(gh, args.org, name, args.branch_name, branch_sha, msg)
+                else:
+                    put_file(gh, args.org, name, args.branch_name, content,
+                             branch_sha, msg)
+                url = open_url or create_pr(gh, args.org, name, info.default_branch,
+                                            args.branch_name, decision, action,
+                                            args.runner_scope)
+                summary["scoped"].append((name, url))
+                report_entry["outcome"] = "pr_opened"
+                report_entry["pr_url"] = url
+                report_entry["pr_reused"] = bool(open_url)
             except GhError as e:
                 log.error("[%s] %s", name, e)
                 summary["failed"].append((name, str(e)[:200]))
+                _mark_failed(report, report_entry, name, str(e)[:500])
             except Exception as e:  # never let one repo kill an org-wide run
                 log.exception("[%s] unexpected error", name)
                 summary["failed"].append((name, f"{type(e).__name__}: {e}"))
+                _mark_failed(report, report_entry, name, f"{type(e).__name__}: {e}")
 
     except KeyboardInterrupt:
         interrupted = True
@@ -1603,17 +2340,28 @@ def main() -> int:
     print("\n========== SUMMARY ==========")
     for key, label in (("scoped", "Scoped (override written/PR)"),
                        ("no_change", "No change needed"),
-                       ("unchanged_identical", "Already correct (identical file)"),
+                       ("unchanged_identical", "Already correct (identical settings)"),
                        ("skipped", "Skipped"),
                        ("failed", "Failed")):
         items = summary[key]
         print(f"{label}: {len(items)}")
         for it in items:
             print(f"  {it[0]}: {it[1]}" if isinstance(it, tuple) else f"  {it}")
-    print(f"Total GitHub API calls: {gh.api_calls}")
+    print(f"Total GitHub API calls: {gh.api_calls} ({gh.write_calls} writes)")
     if interrupted:
         return 130
     return 1 if summary["failed"] else 0
+
+
+def _mark_failed(report: list[dict], entry: dict | None, name: str,
+                 error: str) -> None:
+    """Record a failure in the report. Failures before a decision was made
+    previously left no trace in the JSON/CSV at all."""
+    if entry is None:
+        report.append({"repo": name, "outcome": "failed", "error": error})
+    else:
+        entry["outcome"] = "failed"
+        entry["error"] = error
 
 
 if __name__ == "__main__":
