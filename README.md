@@ -1,5 +1,7 @@
 # Workflow App per Language Scan/Runner Scoping for GitHub
 
+> **Start with the [Quick Start Guide](QUICKSTART.md)** for prerequisites and the commands you need, in a few minutes.
+
 Provisions per-repository `veracode.yml` override files across a GitHub organization for the [Veracode GitHub Workflow Integration](https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning). Detects each repo's languages, dependency manifests, and IaC artifacts, then disables the scan triggers that do not apply, so an IaC repo does not fail SAST, a docs repo does not fail SCA, and gating on scan results does not block PRs.
 
 -----
