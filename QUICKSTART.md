@@ -4,7 +4,7 @@ A short, practical guide to running the tool. For full details on detection logi
 
 ## What this tool does
 
-It scans every repository in your GitHub organization and adds a small `veracode.yml` file to repos where some Veracode scans do not apply. For example:
+It scans every repository in one or more GitHub organizations and adds a small `veracode.yml` file to repos where some Veracode scans do not apply. For example:
 
 - A documentation repo gets SAST and SCA turned off (nothing to scan).
 - An infrastructure repo with no code gets SAST turned off.
@@ -34,8 +34,9 @@ Create a **classic Personal Access Token** with these scopes:
 - `repo`
 - `workflow`
 - `read:org`
+- `read:enterprise` (only if you use `--enterprise`)
 
-If your org uses SAML SSO, click **Configure SSO** on the token and authorize it for your org.
+If your orgs use SAML SSO, click **Configure SSO** on the token and authorize it for **each** org you want to process. Orgs the token is not authorized for are reported and skipped.
 
 Then pick **one** of these options:
 
@@ -67,7 +68,14 @@ gh auth status
 
 ## 3. Run it (3 steps)
 
-Replace `my-org` with your GitHub organization name.
+Replace `my-org` with your GitHub organization name. To cover several orgs, use any of these in place of `--org my-org`:
+
+| Target | Flag |
+|---|---|
+| A few orgs | `--org org-a org-b org-c` |
+| A list in a file (one org per line) | `--orgs-file orgs.txt` |
+| Every org in your enterprise | `--enterprise my-enterprise-slug` |
+| Only some orgs of the enterprise | `--enterprise my-enterprise-slug --orgs-file pilot.txt` |
 
 > On Windows, use `python` instead of `python3` if `python3` is not recognized.
 
@@ -142,7 +150,9 @@ python3 script.py --org my-org --resume-from run1.json --report run2.json
 | Error message | Fix |
 |---|---|
 | `gh CLI not available or not authenticated` | Install `gh`, then run `gh auth login` or set `GITHUB_TOKEN`. |
-| `Cannot access org my-org with this token` | Check the org name spelling, token scopes (`repo`, `read:org`), and SSO authorization. |
+| `[my-org] cannot access org, skipping this org` | Check the org name spelling, token scopes (`repo`, `read:org`), and SSO authorization for that org. Other orgs still run. |
+| `N enterprise org(s) are hidden from this token` | Authorize the token for SSO on those orgs, then re-run. |
+| `Enterprise '...' is not readable with this token` | Check the enterprise slug and the `read:enterprise` scope. |
 | Run is slow or pauses | Normal. The tool waits automatically to stay within GitHub rate limits. |
 | Some repos show `failed` | Re-run with `--resume-from` to retry only those repos. |
 

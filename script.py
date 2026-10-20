@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 Requirements: an authenticated gh CLI (GH_TOKEN, GITHUB_TOKEN, or `gh auth
-login`) with scopes repo, workflow, read:org. Python 3.9+, stdlib only.
+login`) with scopes repo, workflow, read:org (plus read:enterprise for
+--enterprise), SSO-authorized for every target org. Python 3.9+, stdlib only.
 
 Usage:
   python3 script.py --org my-org --dry-run --report audit.json
-  python3 script.py --org my-org
+  python3 script.py --org org-a org-b org-c --dry-run --report audit.json
+  python3 script.py --orgs-file orgs.txt --report run1.json
+  python3 script.py --enterprise my-ent --dry-run --report audit.json
+  python3 script.py --enterprise my-ent --orgs-file pilot.txt
   python3 script.py --org my-org --iac artifacts --direct-commit
   python3 script.py --org my-org --resume-from run1.json --report run2.json
-
-Tests:
-  python3 -m unittest discover -s tests -v
 """
 
 from __future__ import annotations
@@ -711,6 +712,136 @@ def list_org_repos(gh: GhClient, org: str) -> list[dict]:
     log.info("Listed %d repos in %s (%d API pages)", len(repos), org,
              max(1, (len(repos) + 99) // 100))
     return repos
+
+
+class OrgDiscoveryError(RuntimeError):
+    """The target org list could not be determined."""
+
+
+def read_orgs_file(path: str) -> list[str]:
+    """One org login per line; blank lines and '#' comments ignored. Same
+    format as the bulk enterprise integration script's --orgs-file."""
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip() for ln in f
+                if ln.strip() and not ln.strip().startswith("#")]
+
+
+def dedupe_orgs(orgs: list[str]) -> list[str]:
+    """Org logins are case-insensitive on GitHub; keep first spelling/order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for o in orgs:
+        if o.lower() not in seen:
+            seen.add(o.lower())
+            out.append(o)
+    return out
+
+
+def list_enterprise_orgs(gh: GhClient, enterprise: str,
+                         page_size: int = 100) -> list[str]:
+    """All org logins in a GitHub Enterprise Cloud enterprise via GraphQL
+    (token needs read:enterprise). Orgs the token cannot see, usually SAML
+    SSO not authorized for the PAT on that org, come back as null nodes
+    with an entry in `errors`; gh then exits non-zero but still prints the
+    partial data, which is salvaged. The result is checked against
+    totalCount and a warning names how many orgs are out of reach."""
+    query = ("query($enterprise: String!, $first: Int!, $cursor: String) {"
+             " enterprise(slug: $enterprise) {"
+             " organizations(first: $first, after: $cursor) {"
+             " totalCount nodes { login } pageInfo { hasNextPage endCursor }"
+             " } } }")
+    orgs: list[str] = []
+    seen: set[str] = set()
+    hidden = 0
+    total: int | None = None
+    cursor: str | None = None
+    while True:
+        args = ["api", "graphql", "-f", f"query={query}",
+                "-f", f"enterprise={enterprise}", "-F", f"first={page_size}"]
+        if cursor:
+            args += ["-f", f"cursor={cursor}"]
+        try:
+            payload = gh.json(args) or {}
+            errors: list = []
+        except GhError as e:
+            try:
+                payload = json.loads(e.stdout) if e.stdout.strip() else {}
+            except json.JSONDecodeError:
+                payload = {}
+            errors = [e.stderr.strip()[:200]]
+        if not isinstance(payload, dict):
+            payload = {}
+        errors += [str((x or {}).get("message", x))[:200]
+                   for x in (payload.get("errors") or [])]
+        ent = (payload.get("data") or {}).get("enterprise")
+        conn = (ent or {}).get("organizations")
+        if conn is None:
+            raise OrgDiscoveryError(
+                f"Enterprise '{enterprise}' is not readable with this token "
+                f"after {len(orgs)} orgs (check the slug, the read:enterprise "
+                f"scope, and SSO authorization): {'; '.join(errors[:3])}")
+        for node in conn.get("nodes") or []:
+            login = (node or {}).get("login")
+            if not login:
+                hidden += 1
+            elif login.lower() not in seen:
+                seen.add(login.lower())
+                orgs.append(login)
+        if isinstance(conn.get("totalCount"), int):
+            total = conn["totalCount"]
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            break
+        nxt = info.get("endCursor")
+        if not nxt or nxt == cursor:
+            raise OrgDiscoveryError("Enterprise org pagination returned no new "
+                                    f"cursor after {len(orgs)} orgs")
+        cursor = nxt
+    if hidden:
+        log.warning("%d enterprise org(s) are hidden from this token (usually "
+                    "SAML SSO not authorized for the PAT on those orgs) and "
+                    "will NOT be processed", hidden)
+    if total is not None and len(orgs) + hidden != total:
+        log.warning("Enterprise reports %d orgs but discovery returned %d "
+                    "visible + %d hidden; the list may be incomplete",
+                    total, len(orgs), hidden)
+    log.info("Discovered %d orgs in enterprise %s", len(orgs), enterprise)
+    return orgs
+
+
+def resolve_orgs(gh: GhClient, args) -> list[str]:
+    """Target orgs, with the same semantics as the bulk enterprise
+    integration script:
+      --org / --orgs-file          explicit list (union of both)
+      --enterprise                 every org in the enterprise
+      --enterprise + explicit list the explicit list filtered to orgs that
+                                   are actually in the enterprise"""
+    explicit: list[str] = list(args.org or [])
+    if args.orgs_file:
+        try:
+            from_file = read_orgs_file(args.orgs_file)
+        except OSError as e:
+            raise OrgDiscoveryError(f"Cannot read --orgs-file {args.orgs_file}: {e}")
+        if not from_file:
+            raise OrgDiscoveryError(f"--orgs-file {args.orgs_file} has no org names")
+        explicit += from_file
+    explicit = dedupe_orgs(explicit)
+    if not args.enterprise:
+        return explicit
+    ent_orgs = list_enterprise_orgs(gh, args.enterprise)
+    if not explicit:
+        if not ent_orgs:
+            raise OrgDiscoveryError(f"Enterprise '{args.enterprise}' returned no "
+                                    f"organizations visible to this token")
+        return ent_orgs
+    ent_lower = {o.lower(): o for o in ent_orgs}
+    missing = [o for o in explicit if o.lower() not in ent_lower]
+    if missing:
+        log.warning("Not in enterprise %s (or hidden by SSO), skipped: %s",
+                    args.enterprise, ", ".join(missing))
+    kept = [ent_lower[o.lower()] for o in explicit if o.lower() in ent_lower]
+    log.info("Filtered to %d of %d enterprise orgs", len(kept), len(ent_orgs))
+    return kept
 
 
 def fetch_languages(gh: GhClient, org: str, repo: str) -> dict[str, int]:
@@ -1828,7 +1959,7 @@ def write_csv_report(path: str, report: list[dict]) -> None:
     decisions and reasons as columns, easy to open in Excel/Sheets for
     client review of a dry run before anything is written to GitHub."""
     fieldnames = [
-        "repo", "default_branch", "tree_truncated", "outcome", "action",
+        "org", "repo", "default_branch", "tree_truncated", "outcome", "action",
         "existing_file", "override_written",
         "sast", "sast_reason",
         "sca", "sca_reason",
@@ -1843,6 +1974,7 @@ def write_csv_report(path: str, report: list[dict]) -> None:
             d = r.get("decision") or {}
             reasons = d.get("reasons", {})
             writer.writerow({
+                "org": r.get("org", ""),
                 "repo": r.get("repo"),
                 "default_branch": r.get("default_branch"),
                 "tree_truncated": r.get("tree_truncated"),
@@ -1874,7 +2006,16 @@ def matches_any(name: str, patterns: list[str]) -> bool:
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--org", required=True, help="GitHub organization")
+    ap.add_argument("--org", nargs="+", default=None, metavar="ORG",
+                    help="One or more GitHub organizations")
+    ap.add_argument("--orgs-file", default=None,
+                    help="File with one org login per line ('#' comments "
+                         "allowed). Combined with --org; with --enterprise "
+                         "it filters the enterprise's orgs.")
+    ap.add_argument("--enterprise", default=None, metavar="SLUG",
+                    help="Process every org in this GitHub Enterprise Cloud "
+                         "enterprise (token needs read:enterprise). With "
+                         "--org/--orgs-file, only those orgs are processed.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print decisions and generated YAML, change nothing")
     ap.add_argument("--direct-commit", action="store_true",
@@ -1975,12 +2116,265 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
+                excludes: list[str], iac_mode: str,
+                resume_done: set[tuple[str, str]], report: list[dict],
+                summary: dict) -> None:
+    """Filter, inspect, decide and deliver for every repo of one org.
+    Per-repo failures are recorded and never stop the org or the run.
+    KeyboardInterrupt propagates so the caller can flush reports."""
+    def label(name: str) -> str:
+        return f"{org}/{name}"
+
+    # Pre-filter so resume skipping and language prefetching only consider
+    # repos that will actually be processed.
+    todo: list[dict] = []
+    for repo in repos:
+        name = repo["name"]
+        if not matches_any(name, args.include) or matches_any(name, excludes):
+            summary["skipped"].append((label(name), "filtered")); continue
+        if repo.get("archived") and not args.include_archived:
+            summary["skipped"].append((label(name), "archived")); continue
+        if repo.get("fork") and not args.include_forks:
+            summary["skipped"].append((label(name), "fork")); continue
+        if repo.get("disabled"):
+            summary["skipped"].append((label(name), "disabled")); continue
+        if repo.get("size") == 0:
+            summary["skipped"].append((label(name), "empty")); continue
+        if (org.lower(), name.lower()) in resume_done:
+            summary["skipped"].append((label(name),
+                                       "already processed (--resume-from)"))
+            continue
+        todo.append(repo)
+    log.info("[%s] %d of %d repos to process after filtering", org, len(todo),
+             len(repos))
+
+    prefetched_languages: dict[str, dict[str, int]] = {}
+    if todo and not args.no_graphql:
+        prefetched_languages = batch_fetch_languages(
+            gh, org, [r["name"] for r in todo])
+        log.info("[%s] Prefetched languages for %d/%d repos via GraphQL "
+                 "(any missing fall back to per-repo REST)", org,
+                 len(prefetched_languages), len(todo))
+
+    # Open scoping PRs that a fresh scan no longer justifies (the repo
+    # gained code while the PR sat unmerged) are closed, so a stale
+    # "disable SAST" proposal cannot be merged later. PR mode only.
+    stale_pr_repos: set[str] | None = set()
+    if todo and not args.direct_commit:
+        stale_pr_repos = search_open_scoping_prs(gh, org, args.branch_name)
+
+    for idx, repo in enumerate(todo, 1):
+        name = repo["name"]
+        log.info("[%s %d/%d] %s", org, idx, len(todo), name)
+        report_entry: dict | None = None
+
+        try:
+            info = inspect_repo(gh, org, repo, prefetched_languages)
+            if not info.paths and not info.languages:
+                summary["skipped"].append((label(name), "no readable content"))
+                continue
+
+            deep_hits = None
+            if args.deep_iac and iac_mode == "artifacts":
+                cands = ambiguous_root_yaml(info, mx)
+                if cands:
+                    deep_hits = deep_iac_confirm(gh, org, name,
+                                                 info.default_branch, cands)
+
+            win_signals = scan_windows_signals(info.paths, mx)
+            dotnet_hit = None
+            if args.runner == "auto":
+                strong_sig, weak_sig, proj_files = win_signals
+                # Automatic: weak signals need confirmation before Windows is
+                # ever chosen, so inspect project files whenever weak signals
+                # exist without a strong one. --deep-dotnet extends inspection
+                # to ALL repos with project files (catches Framework-targeting
+                # SDK-style projects with zero surface signals).
+                if not strong_sig and proj_files and (weak_sig or args.deep_dotnet):
+                    dotnet_hit = deep_dotnet_check(gh, org, name,
+                                                   info.default_branch,
+                                                   proj_files, mx,
+                                                   max_files=args.max_project_files)
+
+            decision = decide(info, mx, deep_hits, dotnet_hit, win_signals,
+                              iac_mode=iac_mode,
+                              windows_runner=args.windows_runner)
+            if args.runner == "off":
+                if decision.runner:
+                    decision.reasons["runner"] = ("windows signals detected "
+                                                  "but runner selection "
+                                                  "disabled via --runner off")
+                decision.runner = None
+            content = build_override_yaml(
+                decision, args.platform_analysis, args.runner_scope,
+                disable_issue_triggers=not args.keep_issue_triggers)
+
+            log.info("[%s/%s] SAST=%s SCA=%s IaC=%s runner=%s", org, name,
+                     decision.sast, decision.sca, decision.iac,
+                     decision.runner or "default")
+            for k in SECTION_KEYS:
+                log.debug("[%s/%s]   %s: %s", org, name, k, decision.reasons[k])
+
+            report_entry = {"org": org, "repo": name,
+                            "default_branch": info.default_branch,
+                            "languages": info.languages,
+                            "tree_truncated": info.tree_truncated,
+                            "decision": asdict(decision),
+                            "runner_scope": args.runner_scope,
+                            "override_written": content is not None,
+                            "existing_file": None,
+                            "action": None,
+                            "outcome": None}
+            report.append(report_entry)
+
+            # --- Existing file: managed (ours) or hand-written? ---
+            existing_text = None
+            existing_managed = False
+            if info.existing_veracode_sha:
+                if content is not None and \
+                        git_blob_sha(content) == info.existing_veracode_sha:
+                    report_entry["existing_file"] = "managed"
+                    summary["unchanged_identical"].append(label(name))
+                    report_entry["outcome"] = "already_correct"
+                    log.info("[%s/%s] existing veracode.yml already matches, "
+                             "skipping", org, name)
+                    continue
+                existing_text = fetch_blob_text(gh, org, name,
+                                                info.existing_veracode_sha)
+                existing_managed = existing_text is not None and is_managed(existing_text)
+                report_entry["existing_file"] = ("managed" if existing_managed
+                                                 else "unmanaged")
+
+            action = None
+            if content is None:
+                if existing_managed:
+                    action = "delete"
+                else:
+                    note = ("all default scans relevant, no override needed"
+                            + ("; hand-written veracode.yml left untouched"
+                               if info.existing_veracode_sha else ""))
+                    report_entry["outcome"] = "no_change"
+                    summary["no_change"].append(label(name))
+                    log.info("[%s/%s] %s", org, name, note)
+                    if stale_pr_repos and name.lower() in stale_pr_repos:
+                        url = find_pr(gh, org, name, args.branch_name,
+                                      open_only=True)
+                        if url:
+                            report_entry["stale_pr"] = url
+                            if args.dry_run:
+                                log.info("[%s/%s] would close outdated scoping "
+                                         "PR %s", org, name, url)
+                            else:
+                                close_stale_pr(gh, org, name, url)
+                                log.info("[%s/%s] closed outdated scoping PR %s",
+                                         org, name, url)
+                    continue
+            else:
+                if info.existing_veracode_sha:
+                    if existing_text is not None and \
+                            yaml_body(existing_text) == yaml_body(content):
+                        # Same settings, only the reason header differs
+                        # (a file list or truncation note changed). No
+                        # churn, no --force needed.
+                        summary["unchanged_identical"].append(label(name))
+                        report_entry["outcome"] = "already_correct"
+                        log.info("[%s/%s] existing veracode.yml has identical "
+                                 "settings, skipping", org, name)
+                        continue
+                    if not existing_managed and not args.force:
+                        summary["skipped"].append(
+                            (label(name), "hand-written veracode.yml with "
+                                          "different settings (review, or use "
+                                          "--force)"))
+                        report_entry["outcome"] = "skipped_existing_file"
+                        continue
+                    if not existing_managed:
+                        log.warning("[%s/%s] --force: overwriting hand-written "
+                                    "veracode.yml", org, name)
+                action = "write"
+            report_entry["action"] = action
+
+            if args.dry_run:
+                if action == "delete":
+                    print(f"\n===== {org}/{name} (dry run) =====\n"
+                          f"# would DELETE the managed veracode.yml: every "
+                          f"scan type is relevant now\n")
+                    report_entry["outcome"] = "would_delete"
+                else:
+                    print(f"\n===== {org}/{name} (dry run) =====\n{content}")
+                    report_entry["outcome"] = "would_write"
+                summary["scoped"].append((label(name), f"dry-run ({action})"))
+                continue
+
+            msg = ("chore: remove Veracode scan scoping override"
+                   if action == "delete" else
+                   "chore: scope Veracode scans to relevant scan types")
+            if args.direct_commit:
+                if action == "delete":
+                    delete_file(gh, org, name, info.default_branch,
+                                info.existing_veracode_sha, msg)
+                else:
+                    put_file(gh, org, name, info.default_branch, content,
+                             info.existing_veracode_sha, msg)
+                summary["scoped"].append((label(name), f"committed ({action}) "
+                                                       f"to {info.default_branch}"))
+                report_entry["outcome"] = "committed"
+                continue
+
+            open_url = find_pr(gh, org, name, args.branch_name, open_only=True)
+            if not open_url and not existing_managed and not args.reopen_declined:
+                closed_url = find_pr(gh, org, name, args.branch_name,
+                                     open_only=False)
+                if closed_url:
+                    # A previous scoping PR was closed (or merged and the
+                    # file later removed) and the default branch carries
+                    # no managed file: the owners said no. Do not reopen
+                    # on every run.
+                    summary["skipped"].append(
+                        (label(name), f"previous scoping PR declined: "
+                                      f"{closed_url} (use --reopen-declined)"))
+                    report_entry["outcome"] = "pr_declined"
+                    report_entry["pr_url"] = closed_url
+                    continue
+            if not ensure_branch(gh, org, name, info.default_branch,
+                                 args.branch_name, reset_stale=not open_url):
+                summary["failed"].append((label(name), "branch creation failed"))
+                report_entry["outcome"] = "failed_branch_creation"
+                continue
+            branch_sha = get_file_sha_on_ref(gh, org, name, args.branch_name)
+            if action == "delete":
+                delete_file(gh, org, name, args.branch_name, branch_sha, msg)
+            else:
+                put_file(gh, org, name, args.branch_name, content,
+                         branch_sha, msg)
+            url = open_url or create_pr(gh, org, name, info.default_branch,
+                                        args.branch_name, decision, action,
+                                        args.runner_scope)
+            summary["scoped"].append((label(name), url))
+            report_entry["outcome"] = "pr_opened"
+            report_entry["pr_url"] = url
+            report_entry["pr_reused"] = bool(open_url)
+        except GhError as e:
+            log.error("[%s/%s] %s", org, name, e)
+            summary["failed"].append((label(name), str(e)[:200]))
+            _mark_failed(report, report_entry, org, name, str(e)[:500])
+        except Exception as e:  # never let one repo kill an org-wide run
+            log.exception("[%s/%s] unexpected error", org, name)
+            summary["failed"].append((label(name), f"{type(e).__name__}: {e}"))
+            _mark_failed(report, report_entry, org, name,
+                         f"{type(e).__name__}: {e}")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
 
+    if not (args.org or args.orgs_file or args.enterprise):
+        log.error("No target orgs: pass --org, --orgs-file and/or --enterprise")
+        return 2
     iac_mode = "off" if args.no_iac else args.iac
     if args.no_iac and args.iac not in ("always", "off"):
         log.error("--no-iac conflicts with --iac %s", args.iac)
@@ -2012,24 +2406,34 @@ def main(argv: list[str] | None = None) -> int:
 
     # The central 'veracode' config repo must never receive an override,
     # even when the user supplies a custom --exclude list (which replaces
-    # the default rather than extending it).
+    # the default rather than extending it). Applies in every org.
     excludes = list(args.exclude)
     if not matches_any("veracode", excludes):
         excludes.append("veracode")
         log.info("Added central 'veracode' repo to excludes automatically.")
 
-    resume_done: set[str] = set()
+    # Resume state is keyed by (org, repo), case-insensitive. Reports from
+    # the single-org version carry the org only at the top level; that value
+    # is used for their entries.
+    resume_done: set[tuple[str, str]] = set()
     carried: list[dict] = []
     if args.resume_from:
         try:
             with open(args.resume_from) as f:
                 prior = json.load(f)
+            prior_org = prior.get("org")
             for r in prior.get("repos", []):
-                if isinstance(r, dict) and r.get("repo") \
-                        and r.get("outcome") in TERMINAL_OUTCOMES \
-                        and r["repo"] not in resume_done:
-                    resume_done.add(r["repo"])
-                    carried.append(dict(r, carried_over=True))
+                if not (isinstance(r, dict) and r.get("repo")
+                        and r.get("outcome") in TERMINAL_OUTCOMES):
+                    continue
+                org_of = r.get("org") or prior_org
+                if not isinstance(org_of, str) or not org_of:
+                    continue
+                key = (org_of.lower(), str(r["repo"]).lower())
+                if key in resume_done:
+                    continue
+                resume_done.add(key)
+                carried.append(dict(r, org=org_of, carried_over=True))
             log.info("Resume: %d repos with terminal outcomes in %s will be "
                      "skipped and carried into the new report",
                      len(resume_done), args.resume_from)
@@ -2043,7 +2447,8 @@ def main(argv: list[str] | None = None) -> int:
     # Authentication is whatever gh resolves: GH_TOKEN, then GITHUB_TOKEN,
     # then stored `gh auth login` credentials (GH_ENTERPRISE_TOKEN/GH_HOST
     # for GHES). Checking one env var here gave false assurance when
-    # another token took precedence.
+    # another token took precedence. One token serves every org, so the
+    # rate limiter and write pacing are shared across the whole run.
     token_source = ("GH_TOKEN" if os.environ.get("GH_TOKEN") else
                     "GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else
                     "gh stored credentials")
@@ -2054,22 +2459,22 @@ def main(argv: list[str] | None = None) -> int:
                   token_source, e)
         return 2
     log.info("Authenticated via %s", token_source)
-    try:
-        gh.run(["api", f"orgs/{args.org}", "--jq", ".login"])
-    except GhError as e:
-        log.error("Cannot access org %s with this token (check the org name, "
-                  "token scopes repo + read:org, and SAML SSO authorization): %s",
-                  args.org, e.stderr.strip()[:200])
-        return 2
 
     try:
-        repos = list_org_repos(gh, args.org)
-    except GhError as e:
-        log.error("Cannot list repos for org %s: %s", args.org, e)
+        orgs = resolve_orgs(gh, args)
+    except (OrgDiscoveryError, GhError) as e:
+        log.error("%s", e)
         return 2
+    if not orgs:
+        log.error("No orgs left to process")
+        return 2
+    log.info("Processing %d org(s): %s%s", len(orgs), ", ".join(orgs[:20]),
+             f" (+{len(orgs) - 20} more)" if len(orgs) > 20 else "")
+
     summary = {"scoped": [], "no_change": [], "unchanged_identical": [],
                "skipped": [], "failed": []}
     report: list[dict] = list(carried)
+    org_errors: list[dict] = []
     interrupted = False
 
     def flush_reports() -> None:
@@ -2079,12 +2484,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.report:
             try:
                 with open(args.report, "w") as f:
-                    json.dump({"org": args.org,
+                    json.dump({"org": orgs[0] if len(orgs) == 1 else None,
+                               "orgs": orgs,
                                "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                           time.gmtime()),
                                "api_calls": gh.api_calls,
                                "write_calls": gh.write_calls,
                                "interrupted": interrupted,
+                               "org_errors": org_errors,
                                "repos": report}, f, indent=2)
                 log.info("Audit report written to %s", args.report)
             except OSError as e:
@@ -2097,239 +2504,29 @@ def main(argv: list[str] | None = None) -> int:
             except OSError as e:
                 log.error("Failed writing CSV %s: %s", csv_path, e)
 
-    # Pre-filter so resume skipping and language prefetching only consider
-    # repos that will actually be processed.
-    todo: list[dict] = []
-    for repo in repos:
-        name = repo["name"]
-        if not matches_any(name, args.include) or matches_any(name, excludes):
-            summary["skipped"].append((name, "filtered")); continue
-        if repo.get("archived") and not args.include_archived:
-            summary["skipped"].append((name, "archived")); continue
-        if repo.get("fork") and not args.include_forks:
-            summary["skipped"].append((name, "fork")); continue
-        if repo.get("disabled"):
-            summary["skipped"].append((name, "disabled")); continue
-        if repo.get("size") == 0:
-            summary["skipped"].append((name, "empty")); continue
-        if name in resume_done:
-            summary["skipped"].append((name, "already processed (--resume-from)"))
-            continue
-        todo.append(repo)
-    log.info("%d of %d repos to process after filtering", len(todo), len(repos))
+    def org_failed(org: str, what: str, e: GhError) -> None:
+        err = e.stderr.strip()[:300]
+        log.error("[%s] %s, skipping this org (check the org name, token "
+                  "scopes repo + read:org, and SAML SSO authorization for "
+                  "this org): %s", org, what, err)
+        org_errors.append({"org": org, "error": f"{what}: {err}"})
+        summary["failed"].append((org, f"{what}: {err[:150]}"))
 
     try:
-        prefetched_languages: dict[str, dict[str, int]] = {}
-        if todo and not args.no_graphql:
-            prefetched_languages = batch_fetch_languages(
-                gh, args.org, [r["name"] for r in todo])
-            log.info("Prefetched languages for %d/%d repos via GraphQL "
-                     "(any missing fall back to per-repo REST)",
-                     len(prefetched_languages), len(todo))
-
-        # Open scoping PRs that a fresh scan no longer justifies (the repo
-        # gained code while the PR sat unmerged) are closed, so a stale
-        # "disable SAST" proposal cannot be merged later. PR mode only.
-        stale_pr_repos: set[str] | None = set()
-        if todo and not args.direct_commit:
-            stale_pr_repos = search_open_scoping_prs(gh, args.org, args.branch_name)
-
-        for idx, repo in enumerate(todo, 1):
-            name = repo["name"]
-            log.info("[%d/%d] %s", idx, len(todo), name)
-            report_entry: dict | None = None
-
+        for oidx, org in enumerate(orgs, 1):
+            log.info("========== Org %d/%d: %s ==========", oidx, len(orgs), org)
             try:
-                info = inspect_repo(gh, args.org, repo, prefetched_languages)
-                if not info.paths and not info.languages:
-                    summary["skipped"].append((name, "no readable content")); continue
-
-                deep_hits = None
-                if args.deep_iac and iac_mode == "artifacts":
-                    cands = ambiguous_root_yaml(info, mx)
-                    if cands:
-                        deep_hits = deep_iac_confirm(gh, args.org, name,
-                                                     info.default_branch, cands)
-
-                win_signals = scan_windows_signals(info.paths, mx)
-                dotnet_hit = None
-                if args.runner == "auto":
-                    strong_sig, weak_sig, proj_files = win_signals
-                    # Automatic: weak signals need confirmation before Windows is
-                    # ever chosen, so inspect project files whenever weak signals
-                    # exist without a strong one. --deep-dotnet extends inspection
-                    # to ALL repos with project files (catches Framework-targeting
-                    # SDK-style projects with zero surface signals).
-                    if not strong_sig and proj_files and (weak_sig or args.deep_dotnet):
-                        dotnet_hit = deep_dotnet_check(gh, args.org, name,
-                                                       info.default_branch,
-                                                       proj_files, mx,
-                                                       max_files=args.max_project_files)
-
-                decision = decide(info, mx, deep_hits, dotnet_hit, win_signals,
-                                  iac_mode=iac_mode,
-                                  windows_runner=args.windows_runner)
-                if args.runner == "off":
-                    if decision.runner:
-                        decision.reasons["runner"] = ("windows signals detected "
-                                                      "but runner selection "
-                                                      "disabled via --runner off")
-                    decision.runner = None
-                content = build_override_yaml(
-                    decision, args.platform_analysis, args.runner_scope,
-                    disable_issue_triggers=not args.keep_issue_triggers)
-
-                log.info("[%s] SAST=%s SCA=%s IaC=%s runner=%s", name,
-                         decision.sast, decision.sca, decision.iac,
-                         decision.runner or "default")
-                for k in SECTION_KEYS:
-                    log.debug("[%s]   %s: %s", name, k, decision.reasons[k])
-
-                report_entry = {"repo": name, "default_branch": info.default_branch,
-                                "languages": info.languages,
-                                "tree_truncated": info.tree_truncated,
-                                "decision": asdict(decision),
-                                "runner_scope": args.runner_scope,
-                                "override_written": content is not None,
-                                "existing_file": None,
-                                "action": None,
-                                "outcome": None}
-                report.append(report_entry)
-
-                # --- Existing file: managed (ours) or hand-written? ---
-                existing_text = None
-                existing_managed = False
-                if info.existing_veracode_sha:
-                    if content is not None and \
-                            git_blob_sha(content) == info.existing_veracode_sha:
-                        report_entry["existing_file"] = "managed"
-                        summary["unchanged_identical"].append(name)
-                        report_entry["outcome"] = "already_correct"
-                        log.info("[%s] existing veracode.yml already matches, skipping", name)
-                        continue
-                    existing_text = fetch_blob_text(gh, args.org, name,
-                                                    info.existing_veracode_sha)
-                    existing_managed = existing_text is not None and is_managed(existing_text)
-                    report_entry["existing_file"] = ("managed" if existing_managed
-                                                     else "unmanaged")
-
-                action = None
-                if content is None:
-                    if existing_managed:
-                        action = "delete"
-                    else:
-                        note = ("all default scans relevant, no override needed"
-                                + ("; hand-written veracode.yml left untouched"
-                                   if info.existing_veracode_sha else ""))
-                        report_entry["outcome"] = "no_change"
-                        summary["no_change"].append(name)
-                        log.info("[%s] %s", name, note)
-                        if stale_pr_repos and name.lower() in stale_pr_repos:
-                            url = find_pr(gh, args.org, name, args.branch_name,
-                                          open_only=True)
-                            if url:
-                                report_entry["stale_pr"] = url
-                                if args.dry_run:
-                                    log.info("[%s] would close outdated scoping PR %s",
-                                             name, url)
-                                else:
-                                    close_stale_pr(gh, args.org, name, url)
-                                    log.info("[%s] closed outdated scoping PR %s",
-                                             name, url)
-                        continue
-                else:
-                    if info.existing_veracode_sha:
-                        if existing_text is not None and \
-                                yaml_body(existing_text) == yaml_body(content):
-                            # Same settings, only the reason header differs
-                            # (a file list or truncation note changed). No
-                            # churn, no --force needed.
-                            summary["unchanged_identical"].append(name)
-                            report_entry["outcome"] = "already_correct"
-                            log.info("[%s] existing veracode.yml has identical "
-                                     "settings, skipping", name)
-                            continue
-                        if not existing_managed and not args.force:
-                            summary["skipped"].append(
-                                (name, "hand-written veracode.yml with different "
-                                       "settings (review, or use --force)"))
-                            report_entry["outcome"] = "skipped_existing_file"
-                            continue
-                        if not existing_managed:
-                            log.warning("[%s] --force: overwriting hand-written "
-                                        "veracode.yml", name)
-                    action = "write"
-                report_entry["action"] = action
-
-                if args.dry_run:
-                    if action == "delete":
-                        print(f"\n===== {name} (dry run) =====\n"
-                              f"# would DELETE the managed veracode.yml: every "
-                              f"scan type is relevant now\n")
-                        report_entry["outcome"] = "would_delete"
-                    else:
-                        print(f"\n===== {name} (dry run) =====\n{content}")
-                        report_entry["outcome"] = "would_write"
-                    summary["scoped"].append((name, f"dry-run ({action})"))
-                    continue
-
-                msg = ("chore: remove Veracode scan scoping override"
-                       if action == "delete" else
-                       "chore: scope Veracode scans to relevant scan types")
-                if args.direct_commit:
-                    if action == "delete":
-                        delete_file(gh, args.org, name, info.default_branch,
-                                    info.existing_veracode_sha, msg)
-                    else:
-                        put_file(gh, args.org, name, info.default_branch, content,
-                                 info.existing_veracode_sha, msg)
-                    summary["scoped"].append((name, f"committed ({action}) to "
-                                                    f"{info.default_branch}"))
-                    report_entry["outcome"] = "committed"
-                    continue
-
-                open_url = find_pr(gh, args.org, name, args.branch_name, open_only=True)
-                if not open_url and not existing_managed and not args.reopen_declined:
-                    closed_url = find_pr(gh, args.org, name, args.branch_name,
-                                         open_only=False)
-                    if closed_url:
-                        # A previous scoping PR was closed (or merged and the
-                        # file later removed) and the default branch carries
-                        # no managed file: the owners said no. Do not reopen
-                        # on every run.
-                        summary["skipped"].append(
-                            (name, f"previous scoping PR declined: {closed_url} "
-                                   f"(use --reopen-declined)"))
-                        report_entry["outcome"] = "pr_declined"
-                        report_entry["pr_url"] = closed_url
-                        continue
-                if not ensure_branch(gh, args.org, name, info.default_branch,
-                                     args.branch_name, reset_stale=not open_url):
-                    summary["failed"].append((name, "branch creation failed"))
-                    report_entry["outcome"] = "failed_branch_creation"
-                    continue
-                branch_sha = get_file_sha_on_ref(gh, args.org, name, args.branch_name)
-                if action == "delete":
-                    delete_file(gh, args.org, name, args.branch_name, branch_sha, msg)
-                else:
-                    put_file(gh, args.org, name, args.branch_name, content,
-                             branch_sha, msg)
-                url = open_url or create_pr(gh, args.org, name, info.default_branch,
-                                            args.branch_name, decision, action,
-                                            args.runner_scope)
-                summary["scoped"].append((name, url))
-                report_entry["outcome"] = "pr_opened"
-                report_entry["pr_url"] = url
-                report_entry["pr_reused"] = bool(open_url)
+                gh.run(["api", f"orgs/{org}", "--jq", ".login"])
             except GhError as e:
-                log.error("[%s] %s", name, e)
-                summary["failed"].append((name, str(e)[:200]))
-                _mark_failed(report, report_entry, name, str(e)[:500])
-            except Exception as e:  # never let one repo kill an org-wide run
-                log.exception("[%s] unexpected error", name)
-                summary["failed"].append((name, f"{type(e).__name__}: {e}"))
-                _mark_failed(report, report_entry, name, f"{type(e).__name__}: {e}")
-
+                org_failed(org, "cannot access org", e)
+                continue
+            try:
+                repos = list_org_repos(gh, org)
+            except GhError as e:
+                org_failed(org, "cannot list repos", e)
+                continue
+            process_org(gh, org, repos, args, mx, excludes, iac_mode,
+                        resume_done, report, summary)
     except KeyboardInterrupt:
         interrupted = True
         log.warning("Interrupted (Ctrl-C). Writing partial reports for the "
@@ -2338,6 +2535,7 @@ def main(argv: list[str] | None = None) -> int:
         flush_reports()
 
     print("\n========== SUMMARY ==========")
+    print(f"Orgs: {len(orgs)} ({len(org_errors)} not accessible)")
     for key, label in (("scoped", "Scoped (override written/PR)"),
                        ("no_change", "No change needed"),
                        ("unchanged_identical", "Already correct (identical settings)"),
@@ -2350,15 +2548,18 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Total GitHub API calls: {gh.api_calls} ({gh.write_calls} writes)")
     if interrupted:
         return 130
+    if len(org_errors) == len(orgs):
+        return 2  # nothing could be processed at all
     return 1 if summary["failed"] else 0
 
 
-def _mark_failed(report: list[dict], entry: dict | None, name: str,
+def _mark_failed(report: list[dict], entry: dict | None, org: str, name: str,
                  error: str) -> None:
     """Record a failure in the report. Failures before a decision was made
     previously left no trace in the JSON/CSV at all."""
     if entry is None:
-        report.append({"repo": name, "outcome": "failed", "error": error})
+        report.append({"org": org, "repo": name, "outcome": "failed",
+                       "error": error})
     else:
         entry["outcome"] = "failed"
         entry["error"] = error

@@ -2,7 +2,7 @@
 
 > **Start with the [Quick Start Guide](QUICKSTART.md)** for prerequisites and the commands you need, in a few minutes.
 
-Provisions per-repository `veracode.yml` override files across a GitHub organization for the [Veracode GitHub Workflow Integration](https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning). Detects each repo's languages, dependency manifests, and IaC artifacts, then disables the scan triggers that do not apply, so an IaC repo does not fail SAST, a docs repo does not fail SCA, and gating on scan results does not block PRs.
+Provisions per-repository `veracode.yml` override files across one or more GitHub organizations (an explicit list, a file, or every org in an enterprise) for the [Veracode GitHub Workflow Integration](https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning). Detects each repo's languages, dependency manifests, and IaC artifacts, then disables the scan triggers that do not apply, so an IaC repo does not fail SAST, a docs repo does not fail SCA, and gating on scan results does not block PRs.
 
 -----
 
@@ -101,7 +101,7 @@ Every safeguard below is active by default and tunable via `--config`.
 ## Prerequisites
 
 - `gh` CLI installed and on `PATH` (the script shells out to it for every GitHub API call)
-- An authenticated `gh`: `GH_TOKEN`, then `GITHUB_TOKEN`, then stored `gh auth login` credentials, in `gh`'s own order of precedence (`GH_HOST` / `GH_ENTERPRISE_TOKEN` for GitHub Enterprise Server). The script logs which source is in use and checks org access before doing anything.
+- An authenticated `gh`: `GH_TOKEN`, then `GITHUB_TOKEN`, then stored `gh auth login` credentials, in `gh`'s own order of precedence (`GH_HOST` / `GH_ENTERPRISE_TOKEN` for GitHub Enterprise Server). The script logs which source is in use and checks access to each org before processing it. One token serves every org in the run, so it needs access to all of them (same account model as the bulk enterprise integration script).
 - Python 3.9+, standard library only, no pip install required
 
 ### GitHub Personal Access Token Setup
@@ -113,8 +113,9 @@ Create a classic Personal Access Token (PAT) with the following scopes:
 | `repo` | Full control of private repositories (needed for reading repo contents and creating/updating files) |
 | `workflow` | Update GitHub Actions workflows (required by the integration scope) |
 | `read:org` | Read organization data (needed for listing repos and reading org settings) |
+| `read:enterprise` | Only with `--enterprise`: list every org in the enterprise |
 
-For SAML SSO organizations, authorize the token for the org. Then either:
+For SAML SSO organizations, authorize the token for **every** target org. With `--enterprise`, orgs the token is not SSO-authorized for are hidden by GitHub; the script warns with the count and does not process them. An org that cannot be read is recorded in the report and skipped; the other orgs continue. Then either:
 
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
@@ -141,6 +142,12 @@ or use `gh auth login` once and run the script with no token variable set. If `G
 # Phase 1 - see what would change, review before touching anything
 python3 script.py --org my-org --dry-run --report audit.json
 
+# Several orgs, a file of orgs, or a whole enterprise
+python3 script.py --org org-a org-b org-c --dry-run --report audit.json
+python3 script.py --orgs-file orgs.txt --dry-run --report audit.json
+python3 script.py --enterprise my-ent --dry-run --report audit.json
+python3 script.py --enterprise my-ent --orgs-file pilot.txt   # only these enterprise orgs
+
 # Phase 2 - pilot on a subset (include at least one Windows-bound .NET repo)
 python3 script.py --org my-org --include 'team-*'
 
@@ -159,9 +166,13 @@ python3 script.py --org my-org --resume-from run1.json --report run2.json
 
 | Flag | Default | Description |
 |---|---|---|
-| `--org ORG` | *(required)* | GitHub organization |
-| `--include PATTERN [...]` | `*` | Glob patterns of repos to include (case-insensitive) |
-| `--exclude PATTERN [...]` | `veracode` | Glob patterns of repos to skip. The central `veracode` repo is always excluded. |
+| `--org ORG [ORG ...]` | none | One or more GitHub organizations |
+| `--orgs-file FILE` | none | One org login per line, `#` comments allowed. Combined with `--org`. Same format as the bulk enterprise integration script. |
+| `--enterprise SLUG` | none | Every org in this Enterprise Cloud enterprise (GraphQL, needs `read:enterprise`). Combined with `--org`/`--orgs-file`, only the listed orgs that belong to the enterprise are processed; others are logged and skipped. |
+
+At least one of `--org`, `--orgs-file`, `--enterprise` is required. Org names are matched case-insensitively and de-duplicated. Orgs are processed one after another with one shared rate limiter and write budget, since GitHub applies those limits per token, not per org.
+| `--include PATTERN [...]` | `*` | Glob patterns of repos to include (case-insensitive, applied in every org) |
+| `--exclude PATTERN [...]` | `veracode` | Glob patterns of repos to skip. The central `veracode` repo is always excluded in every org. |
 | `--include-archived` | off | Otherwise archived repos are skipped |
 | `--include-forks` | off | Otherwise forks are skipped |
 
@@ -211,7 +222,7 @@ Language data is prefetched in batches of 40 repos per GraphQL call (disable wit
 | Flag | Default | Description |
 |---|---|---|
 | `--report FILE` | none | Write a JSON audit report: per-repo languages, decisions, reasons, full detection evidence, action, and outcome. Written even when the run is interrupted (Ctrl-C) or crashes, with an `interrupted` flag. Failed repos are included with their error. |
-| `--resume-from FILE` | none | Skip repos that already reached a terminal outcome (`no_change`, `already_correct`, `committed`, `pr_opened`, `skipped_existing_file`, `pr_declined`) in a prior `--report` JSON. Their entries are carried into the new report (`carried_over: true`), so chained resumes stay cumulative. Failed and dry-run outcomes are retried. |
+| `--resume-from FILE` | none | Skip repos (matched by org and repo name) that already reached a terminal outcome (`no_change`, `already_correct`, `committed`, `pr_opened`, `skipped_existing_file`, `pr_declined`) in a prior `--report` JSON. Their entries are carried into the new report (`carried_over: true`), so chained resumes stay cumulative. Failed and dry-run outcomes are retried. Reports from the earlier single-org version are accepted. |
 | `--no-graphql` | off | Disable batched GraphQL language prefetching and use one REST call per repo instead |
 | `--csv FILE` | `dry_run_report.csv` on `--dry-run`, off otherwise | Write a flat CSV: one row per repo with outcome, action, scan decisions, reasons, runner, languages, PR URL, and error. |
 | `-v`, `--verbose` | off | Debug-level logging, including the per-scan-type reasoning for every repo |
@@ -297,10 +308,11 @@ When a file's settings are already correct, it is not rewritten just to refresh 
 
 ### Summary
 
-Printed at the end of every run:
+Printed at the end of every run (repos are shown as `org/repo`):
 
 ```
 ========== SUMMARY ==========
+Orgs: 3 (0 not accessible)
 Scoped (override written/PR): 41
 No change needed: 12
 Already correct (identical settings): 3
@@ -314,12 +326,15 @@ Total GitHub API calls: 187 (96 writes)
 ```json
 {
   "org": "my-org",
+  "orgs": ["my-org"],
   "generated": "2026-09-28T00:00:00Z",
   "api_calls": 187,
   "write_calls": 96,
   "interrupted": false,
+  "org_errors": [],
   "repos": [
     {
+      "org": "my-org",
       "repo": "payments-api",
       "default_branch": "main",
       "languages": {"Java": 128000},
@@ -344,13 +359,15 @@ Total GitHub API calls: 187 (96 writes)
 }
 ```
 
+`org` is set only when a single org was processed (kept for compatibility); `orgs` always lists them all. `org_errors` lists orgs that could not be read or listed (`{"org", "error"}`).
+
 `existing_file` is `managed`, `unmanaged`, or `null`. `action` is `write`, `delete`, or `null`.
 
 `outcome` values: `no_change`, `already_correct`, `would_write` / `would_delete` (dry run), `committed`, `pr_opened` (with `pr_reused` when an open PR was updated), `skipped_existing_file` (hand-written file), `pr_declined`, `failed_branch_creation`, `failed` (with `error`).
 
 ### `--csv` report
 
-Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv FILE` to name it explicitly, or to also get one on an apply run). One row per repo, flattened for review in Excel/Sheets before anything touches GitHub. Columns: `repo, default_branch, tree_truncated, outcome, action, existing_file, override_written, sast, sast_reason, sca, sca_reason, iac, iac_reason, runner, runner_reason, languages, pr_url, error, carried_over`.
+Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv FILE` to name it explicitly, or to also get one on an apply run). One row per repo, flattened for review in Excel/Sheets before anything touches GitHub. Columns: `org, repo, default_branch, tree_truncated, outcome, action, existing_file, override_written, sast, sast_reason, sca, sca_reason, iac, iac_reason, runner, runner_reason, languages, pr_url, error, carried_over`.
 
 -----
 
@@ -360,10 +377,10 @@ Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv 
 - Default mode opens a PR for review; no repo is changed without either explicit review or `--direct-commit`
 - Hand-written `veracode.yml` files are never overwritten without `--force`
 - Repo-derived strings are stripped of control characters before they reach YAML comments, logs, or PR bodies, and are rendered as inline code in PR bodies (no @mentions or markdown injection). Runner labels are validated before being written.
-- One repo failing never halts an org-wide run; failures are collected, reported, and retried on `--resume-from`
+- One repo or one inaccessible org never halts a run; failures are collected, reported, and retried on `--resume-from`
 
 -----
 
 ## Support
 
-This is a companion tool to Veracode's GitHub Workflow Integration and is not officially supported by Veracode. For issues, provide the `--report` JSON output, the `--org` used, and the command run.
+This is a companion tool to Veracode's GitHub Workflow Integration and is not officially supported by Veracode. For issues, provide the `--report` JSON output and the exact command run.
