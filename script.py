@@ -308,7 +308,8 @@ DEFAULT_MATRICES: dict = {
     #   *.vbproj/*.fsproj    can be Framework or SDK-style
     #
     # PROJECT MARKERS - lowercase substrings searched inside .csproj/.vbproj/
-    # .fsproj when weak signals exist (automatic) or --deep-dotnet is passed:
+    # .fsproj when weak signals exist (automatic) or --deep-dotnet is passed
+    # (net4x and *-windows TFMs are matched by WINDOWS_TFM_REGEX below):
     "WINDOWS_FILE_NAMES": ["packages.config", "global.asax"],
     "WINDOWS_FILE_SUFFIXES": [".vcxproj", ".vcproj", ".aspx", ".ascx",
                               ".asax", ".master", ".asmx", ".sqlproj",
@@ -321,15 +322,17 @@ DEFAULT_MATRICES: dict = {
         "schemas.microsoft.com/developer/msbuild/2003",  # old project xmlns
         "<usewpf>true",                      # WPF (Windows desktop)
         "<usewindowsforms>true",             # WinForms (Windows desktop)
-        "<targetframework>net4",             # SDK-style targeting Framework
-        "<targetframeworks>net4",
     ],
-    # Windows TFMs (net8.0-windows etc.) are matched with a regex anchored
-    # inside <TargetFramework(s)> element content, not a raw substring: a
-    # loose "-windows<" marker false-matches prose like
+    # Windows-bound TFMs (net4x in any position of a multi-target list, and
+    # net8.0-windows etc.) are matched with a regex anchored inside
+    # <TargetFramework(s)> element content, not a raw substring: a loose
+    # "-windows<" marker false-matches prose like
     # <PackageTags>non-windows</PackageTags> and forces a portable project
-    # onto a Windows runner.
-    "WINDOWS_TFM_REGEX": r"<targetframeworks?>[^<]*-windows",
+    # onto a Windows runner. Attributes (Condition=...) are allowed, except
+    # IsOSPlatform conditions: the MAUI template adds its -windows TFM only
+    # when building ON Windows, so the project still builds on Linux.
+    "WINDOWS_TFM_REGEX": (r"<targetframeworks?(?:\s(?![^>]*isosplatform)[^>]*)?>"
+                          r"[^<]*(?:-windows|\bnet4\d)"),
     # Strong Windows file signals only take effect when the repo shows
     # .NET/C++ evidence (language or project files). Without this gate a
     # stray sample .aspx or a file named *.master in a Python or Java repo
@@ -464,8 +467,11 @@ LEGACY_MANAGED_PREFIX = "# Detection:"
 
 # Runner labels are written verbatim into YAML. Restrict them to what
 # GitHub runner labels and a YAML flow list can contain, so a --windows-runner
-# value can never inject extra configuration.
-RUNNER_LABEL_RE = re.compile(r"^(\[[A-Za-z0-9_.\-, ]+\]|[A-Za-z0-9_.\-]+)$")
+# value can never inject extra configuration. A flow list needs at least one
+# label and no empty elements ("[ ]", "[a,]" would write an unusable runs_on).
+_RUNNER_LABEL = r"[A-Za-z0-9_.\-]+"
+RUNNER_LABEL_RE = re.compile(
+    rf"^(\[ *{_RUNNER_LABEL} *(?:, *{_RUNNER_LABEL} *)*\]|{_RUNNER_LABEL})\Z")
 
 
 def yaml_body(text: str) -> str:
@@ -588,13 +594,23 @@ class GhClient:
         self._calls_since_check = 0
         try:
             out = self._run_once(["api", "rate_limit"])
-            core = json.loads(out)["resources"]["core"]
-            remaining, reset = core["remaining"], core["reset"]
-            log.debug("Rate limit: %s remaining, resets at %s", remaining, reset)
-            if remaining < self.min_remaining:
-                sleep_for = max(reset - time.time(), 0) + 5
-                log.warning("Rate limit low (%s remaining). Sleeping %.0fs until reset.",
-                            remaining, sleep_for)
+            resources = json.loads(out)["resources"]
+            # GraphQL (language/blob batches, enterprise discovery) has its
+            # own bucket; watching core alone let it run dry unnoticed.
+            sleep_for = 0.0
+            for bucket in ("core", "graphql"):
+                res = resources.get(bucket)
+                if not isinstance(res, dict):
+                    continue
+                remaining, reset = res["remaining"], res["reset"]
+                log.debug("Rate limit %s: %s remaining, resets at %s",
+                          bucket, remaining, reset)
+                if remaining < self.min_remaining:
+                    sleep_for = max(sleep_for, max(reset - time.time(), 0) + 5)
+                    log.warning("Rate limit low (%s: %s remaining).", bucket,
+                                remaining)
+            if sleep_for:
+                log.warning("Sleeping %.0fs until reset.", sleep_for)
                 time.sleep(sleep_for)
         except Exception as e:  # never let the health check kill the run
             log.debug("rate_limit check failed, continuing: %s", e)
@@ -849,7 +865,8 @@ def fetch_languages(gh: GhClient, org: str, repo: str) -> dict[str, int]:
 
 
 def _parse_language_batch(payload: dict, group: list[str],
-                          out: dict[str, dict[str, int]]) -> None:
+                          out: dict[str, dict[str, int]],
+                          blobs: dict[str, tuple[str, str]] | None = None) -> None:
     for j, n in enumerate(group):
         node = payload.get(f"r{j}")
         if not isinstance(node, dict):
@@ -860,10 +877,16 @@ def _parse_language_batch(payload: dict, group: list[str],
             if lang:
                 langs[lang] = langs.get(lang, 0) + int(edge.get("size") or 0)
         out[n] = langs
+        blob = node.get("veracodeYml")
+        if blobs is not None and isinstance(blob, dict) and blob.get("oid") \
+                and isinstance(blob.get("text"), str) and not blob.get("isTruncated"):
+            blobs[n] = (blob["oid"], blob["text"].lstrip(chr(0xFEFF)))
 
 
 def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
-                          chunk: int = 40) -> dict[str, dict[str, int]]:
+                          chunk: int = 40,
+                          blobs: dict[str, tuple[str, str]] | None = None
+                          ) -> dict[str, dict[str, int]]:
     """Fetch language data for many repos per API call via aliased GraphQL
     queries, instead of one REST call per repo. For a 20k-repo org this is
     the difference between finishing inside the rate limit and sleeping for
@@ -874,8 +897,15 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
     failure) silently falls back to the per-repo REST call in inspect_repo.
     gh exits non-zero when a GraphQL response contains an errors array but
     still prints the partial data body to stdout, so per-repo errors inside
-    an otherwise good batch are salvaged rather than discarding the chunk."""
+    an otherwise good batch are salvaged rather than discarding the chunk.
+
+    With `blobs`, the root veracode.yml at HEAD (oid + text) is fetched in
+    the same query and stored per repo; the caller uses it only when the
+    oid equals the tree's blob sha, else falls back to the REST blob read."""
     out: dict[str, dict[str, int]] = {}
+    blob_field = ("veracodeYml: object(expression: \"HEAD:veracode.yml\") "
+                  "{ ... on Blob { oid text isTruncated } } "
+                  if blobs is not None else "")
     hard_failures = 0
     for i in range(0, len(names), chunk):
         if hard_failures >= 2:
@@ -893,7 +923,7 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
             # so a plain first:N could drop the dominant language on repos
             # with many small ones. 100 matches the REST endpoint's output.
             "{ languages(first: 100, orderBy: {field: SIZE, direction: DESC}) "
-            "{ edges { size node { name } } } }"
+            "{ edges { size node { name } } } " + blob_field + "}"
             for j, n in enumerate(group)
         ]
         query = "query { " + " ".join(parts) + " }"
@@ -920,7 +950,7 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
             log.warning("GraphQL batch returned unparseable data, %d repos "
                         "fall back to REST", len(group))
             continue
-        _parse_language_batch(payload, group, out)
+        _parse_language_batch(payload, group, out, blobs)
     return out
 
 
@@ -1521,10 +1551,12 @@ def decide(info: RepoInfo, mx: Matrices,
     # agent run with only a Makefile/Gemfile/global.json fails with "no
     # build system found" and, with break_build_on_error, blocks the PR.
     sca = bool(enabling)
-    source_eco_langs = all_langs & mx.sca_languages
     sca_forced_by_truncation = False
-    if not sca and info.tree_truncated and source_eco_langs:
-        sca = True  # cannot prove absence of manifests, stay enabled
+    if not sca and info.tree_truncated:
+        # Fail open regardless of language: a truncated tree cannot prove
+        # absence of manifests (a notebook repo's requirements.txt may sit
+        # past the cut-off, and Linguist reports "Jupyter Notebook").
+        sca = True
         sca_forced_by_truncation = True
     paired = sorted(g for g, gl, _, _ in mx.sca_ecosystem_map
                     if g in eco_hits and gl & all_langs)
@@ -1623,8 +1655,8 @@ def decide(info: RepoInfo, mx: Matrices,
         runner_reason += "; tree truncated, runner detection best-effort"
 
     if sca_forced_by_truncation:
-        sca_reason = ("tree truncated, ecosystem language present, cannot "
-                      "prove absence of manifests, kept enabled")
+        sca_reason = ("tree truncated, cannot prove absence of manifests, "
+                      "kept enabled (fail-open)")
     elif sca:
         sca_reason = (f"manifests={sorted(enabling)[:6]}, "
                       f"ecosystems={sorted(eco_hits)}")
@@ -1868,17 +1900,39 @@ def delete_file(gh: GhClient, org: str, repo: str, branch: str,
         raise
 
 
+REMOVAL_PR_TITLE = "Remove Veracode scan scoping override"
+SCOPING_PR_TITLE = "Scope Veracode scans to relevant scan types"
+
+
 def find_pr(gh: GhClient, org: str, repo: str, head: str, open_only: bool) -> str | None:
-    """URL of the newest PR from `head`: open ones, or closed/merged ones."""
+    """URL of the newest open PR from `head`, or (open_only=False) of the
+    newest scoping PR closed WITHOUT merging, i.e. one the owners declined.
+    Merged PRs were accepted, and the tool's own removal PRs are not a
+    verdict on scoping, so neither counts as declined."""
     if open_only:
-        jq = ".[0].url // empty"
-        state = "open"
-    else:
-        jq = '[.[] | select(.state != "OPEN")][0].url // empty'
-        state = "all"
+        out = gh.run(["pr", "list", "-R", f"{org}/{repo}", "--head", head,
+                      "--state", "open", "--json", "url,state",
+                      "--jq", ".[0].url // empty"])
+        return out.strip() or None
     out = gh.run(["pr", "list", "-R", f"{org}/{repo}", "--head", head,
-                  "--state", state, "--json", "url,state", "--jq", jq])
-    return out.strip() or None
+                  "--state", "all", "--json", "url,state,title,mergedAt"])
+    try:
+        prs = json.loads(out) if out.strip() else []
+    except json.JSONDecodeError:
+        return None
+    # Newest first: only the latest scoping PR's fate counts, so an old
+    # rejection later superseded by a merged scoping PR is not "declined".
+    for pr in prs if isinstance(prs, list) else []:
+        if not isinstance(pr, dict) or str(pr.get("title", "")).startswith(
+                REMOVAL_PR_TITLE):
+            continue
+        state = str(pr.get("state", "")).upper()
+        if state == "OPEN":
+            continue
+        if state == "CLOSED" and not pr.get("mergedAt"):
+            return pr.get("url") or None
+        return None
+    return None
 
 
 def _md(s: str) -> str:
@@ -1907,8 +1961,7 @@ def create_pr(gh: GhClient, org: str, repo: str, base: str, head: str,
           "sandbox/policy scans are governed by analysis_on_platform and are "
           "not changed by this file unless explicitly set."
     )
-    title = ("Remove Veracode scan scoping override" if action == "delete"
-             else "Scope Veracode scans to relevant scan types")
+    title = (REMOVAL_PR_TITLE if action == "delete" else SCOPING_PR_TITLE)
     try:
         out = gh.run(["pr", "create", "-R", f"{org}/{repo}", "--base", base,
                       "--head", head, "--title", title, "--body", body])
@@ -1924,10 +1977,43 @@ def create_pr(gh: GhClient, org: str, repo: str, base: str, head: str,
         raise
 
 
-def close_stale_pr(gh: GhClient, org: str, repo: str, url: str) -> None:
+STALE_PR_COMMENTS = {
+    "no_override": "a fresh scan of the default branch shows every scan type "
+                   "is relevant, so no override is needed.",
+    "already_correct": "the default branch already has the correct "
+                       "veracode.yml settings, so this PR is no longer needed.",
+    "outdated": "its veracode.yml no longer matches a fresh scan of the "
+                "default branch.",
+}
+
+
+def close_stale_pr(gh: GhClient, org: str, repo: str, url: str,
+                   why: str = "no_override") -> None:
     gh.run(["pr", "close", url, "-R", f"{org}/{repo}", "--comment",
-            "Closed by veracode-scan-scoping: a fresh scan of the default branch "
-            "shows every scan type is relevant, so no override is needed."])
+            "Closed by veracode-scan-scoping: " + STALE_PR_COMMENTS[why]])
+
+
+def reconcile_open_pr(gh: GhClient, org: str, repo: str, args,
+                      stale_pr_repos: set[str] | None, report_entry: dict,
+                      why: str, desired: str | None = None) -> None:
+    """Close the repo's open scoping PR when the default branch no longer
+    needs it. With `desired`, a PR whose branch already carries exactly that
+    content is kept (it is still the right proposal). Only repos the per-org
+    search flagged cost any extra calls; best effort, dry-run safe."""
+    if not stale_pr_repos or repo.lower() not in stale_pr_repos:
+        return
+    url = find_pr(gh, org, repo, args.branch_name, open_only=True)
+    if not url:
+        return
+    if desired is not None and get_file_sha_on_ref(
+            gh, org, repo, args.branch_name) == git_blob_sha(desired):
+        return
+    report_entry["stale_pr"] = url
+    if args.dry_run:
+        log.info("[%s/%s] would close outdated scoping PR %s", org, repo, url)
+    else:
+        close_stale_pr(gh, org, repo, url, why)
+        log.info("[%s/%s] closed outdated scoping PR %s", org, repo, url)
 
 
 def search_open_scoping_prs(gh: GhClient, org: str, head: str) -> set[str] | None:
@@ -1951,7 +2037,30 @@ def search_open_scoping_prs(gh: GhClient, org: str, head: str) -> set[str] | Non
 # ---------------------------------------------------------------------------
 
 TERMINAL_OUTCOMES = {"no_change", "already_correct", "committed", "pr_opened",
-                     "skipped_existing_file", "pr_declined"}
+                     "skipped_existing_file", "pr_declined",
+                     "skipped_central_repo"}
+
+_CENTRAL_WORKFLOW_RE = re.compile(r"^\.github/workflows/veracode-[^/]*\.ya?ml$")
+
+
+def looks_like_central_repo(paths: list[str]) -> bool:
+    """Root veracode.yml plus the integration's .github/workflows/veracode-*
+    workflows: the org's central config repo (or a copy of it)."""
+    return "veracode.yml" in paths and any(
+        _CENTRAL_WORKFLOW_RE.match(p.lower()) for p in paths)
+
+
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", chr(13))
+
+
+def _csv_cell(v):
+    """Neutralize spreadsheet formula injection: repo-controlled strings
+    (repo names, default branch names, reasons with file names) starting
+    with = + - @ TAB or CR are evaluated by Excel/Sheets when the CSV is
+    opened. A leading ' makes them plain text."""
+    if isinstance(v, str) and v.startswith(_CSV_FORMULA_PREFIXES):
+        return "'" + v
+    return v
 
 
 def write_csv_report(path: str, report: list[dict]) -> None:
@@ -1967,13 +2076,15 @@ def write_csv_report(path: str, report: list[dict]) -> None:
         "runner", "runner_reason",
         "languages", "pr_url", "error", "carried_over",
     ]
-    with open(path, "w", newline="") as f:
+    # utf-8-sig: Excel only detects UTF-8 with a BOM, and the locale default
+    # (cp1252 on Windows) crashes on non-ASCII file names in reasons.
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in report:
             d = r.get("decision") or {}
             reasons = d.get("reasons", {})
-            writer.writerow({
+            row = {
                 "org": r.get("org", ""),
                 "repo": r.get("repo"),
                 "default_branch": r.get("default_branch"),
@@ -1994,7 +2105,8 @@ def write_csv_report(path: str, report: list[dict]) -> None:
                 "pr_url": r.get("pr_url", ""),
                 "error": r.get("error", ""),
                 "carried_over": r.get("carried_over", False),
-            })
+            }
+            writer.writerow({k: _csv_cell(v) for k, v in row.items()})
 
 
 def matches_any(name: str, patterns: list[str]) -> bool:
@@ -2024,8 +2136,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--include", nargs="+", default=["*"],
                     help="Glob patterns of repos to include")
     ap.add_argument("--exclude", nargs="*", default=["veracode"],
-                    help="Glob patterns to skip (central 'veracode' repo is "
+                    help="Glob patterns to skip (the --central-repo is "
                          "always excluded)")
+    ap.add_argument("--central-repo", default="veracode", metavar="NAME",
+                    help="Name of the central Veracode integration repo "
+                         "(default veracode). Always excluded, even with "
+                         "--force; any repo that looks like one (root "
+                         "veracode.yml + .github/workflows/veracode-*.yml) "
+                         "is skipped too.")
     ap.add_argument("--include-archived", action="store_true")
     ap.add_argument("--include-forks", action="store_true")
     ap.add_argument("--force", action="store_true",
@@ -2131,7 +2249,8 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
     todo: list[dict] = []
     for repo in repos:
         name = repo["name"]
-        if not matches_any(name, args.include) or matches_any(name, excludes):
+        if name.lower() == args.central_repo.lower() or \
+                not matches_any(name, args.include) or matches_any(name, excludes):
             summary["skipped"].append((label(name), "filtered")); continue
         if repo.get("archived") and not args.include_archived:
             summary["skipped"].append((label(name), "archived")); continue
@@ -2150,16 +2269,18 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
              len(repos))
 
     prefetched_languages: dict[str, dict[str, int]] = {}
+    prefetched_blobs: dict[str, tuple[str, str]] = {}
     if todo and not args.no_graphql:
         prefetched_languages = batch_fetch_languages(
-            gh, org, [r["name"] for r in todo])
+            gh, org, [r["name"] for r in todo], blobs=prefetched_blobs)
         log.info("[%s] Prefetched languages for %d/%d repos via GraphQL "
                  "(any missing fall back to per-repo REST)", org,
                  len(prefetched_languages), len(todo))
 
     # Open scoping PRs that a fresh scan no longer justifies (the repo
-    # gained code while the PR sat unmerged) are closed, so a stale
-    # "disable SAST" proposal cannot be merged later. PR mode only.
+    # gained code while the PR sat unmerged, or the default branch already
+    # has the right settings) are closed, so a stale proposal cannot be
+    # merged later. PR mode only.
     stale_pr_repos: set[str] | None = set()
     if todo and not args.direct_commit:
         stale_pr_repos = search_open_scoping_prs(gh, org, args.branch_name)
@@ -2173,6 +2294,17 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
             info = inspect_repo(gh, org, repo, prefetched_languages)
             if not info.paths and not info.languages:
                 summary["skipped"].append((label(name), "no readable content"))
+                continue
+            if looks_like_central_repo(info.paths):
+                # A copy/rename of the central integration repo: its
+                # veracode.yml is the org-wide config, never an override.
+                log.warning("[%s/%s] looks like a central Veracode integration "
+                            "repo (root veracode.yml + veracode-* workflows); "
+                            "never touched, even with --force", org, name)
+                summary["skipped"].append((label(name), "central integration repo"))
+                report.append({"org": org, "repo": name,
+                               "default_branch": info.default_branch,
+                               "outcome": "skipped_central_repo"})
                 continue
 
             deep_hits = None
@@ -2239,9 +2371,15 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                     report_entry["outcome"] = "already_correct"
                     log.info("[%s/%s] existing veracode.yml already matches, "
                              "skipping", org, name)
+                    reconcile_open_pr(gh, org, name, args, stale_pr_repos,
+                                      report_entry, "already_correct")
                     continue
-                existing_text = fetch_blob_text(gh, org, name,
-                                                info.existing_veracode_sha)
+                pre_oid, pre_text = prefetched_blobs.get(name, (None, None))
+                if pre_oid == info.existing_veracode_sha:
+                    existing_text = pre_text  # same blob, no REST read
+                else:
+                    existing_text = fetch_blob_text(gh, org, name,
+                                                    info.existing_veracode_sha)
                 existing_managed = existing_text is not None and is_managed(existing_text)
                 report_entry["existing_file"] = ("managed" if existing_managed
                                                  else "unmanaged")
@@ -2257,18 +2395,8 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                     report_entry["outcome"] = "no_change"
                     summary["no_change"].append(label(name))
                     log.info("[%s/%s] %s", org, name, note)
-                    if stale_pr_repos and name.lower() in stale_pr_repos:
-                        url = find_pr(gh, org, name, args.branch_name,
-                                      open_only=True)
-                        if url:
-                            report_entry["stale_pr"] = url
-                            if args.dry_run:
-                                log.info("[%s/%s] would close outdated scoping "
-                                         "PR %s", org, name, url)
-                            else:
-                                close_stale_pr(gh, org, name, url)
-                                log.info("[%s/%s] closed outdated scoping PR %s",
-                                         org, name, url)
+                    reconcile_open_pr(gh, org, name, args, stale_pr_repos,
+                                      report_entry, "no_override")
                     continue
             else:
                 if info.existing_veracode_sha:
@@ -2281,6 +2409,8 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                         report_entry["outcome"] = "already_correct"
                         log.info("[%s/%s] existing veracode.yml has identical "
                                  "settings, skipping", org, name)
+                        reconcile_open_pr(gh, org, name, args, stale_pr_repos,
+                                          report_entry, "already_correct")
                         continue
                     if not existing_managed and not args.force:
                         summary["skipped"].append(
@@ -2288,6 +2418,9 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                                           "different settings (review, or use "
                                           "--force)"))
                         report_entry["outcome"] = "skipped_existing_file"
+                        reconcile_open_pr(gh, org, name, args, stale_pr_repos,
+                                          report_entry, "outdated",
+                                          desired=content)
                         continue
                     if not existing_managed:
                         log.warning("[%s/%s] --force: overwriting hand-written "
@@ -2327,10 +2460,9 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                 closed_url = find_pr(gh, org, name, args.branch_name,
                                      open_only=False)
                 if closed_url:
-                    # A previous scoping PR was closed (or merged and the
-                    # file later removed) and the default branch carries
-                    # no managed file: the owners said no. Do not reopen
-                    # on every run.
+                    # A previous scoping PR was closed without merging and
+                    # the default branch carries no managed file: the
+                    # owners said no. Do not reopen on every run.
                     summary["skipped"].append(
                         (label(name), f"previous scoping PR declined: "
                                       f"{closed_url} (use --reopen-declined)"))
@@ -2393,9 +2525,9 @@ def main(argv: list[str] | None = None) -> int:
     overrides = None
     if args.config:
         try:
-            with open(args.config) as f:
+            with open(args.config, encoding="utf-8") as f:
                 overrides = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+        except (OSError, ValueError) as e:  # incl. JSON and UTF-8 decode errors
             log.error("Cannot read --config %s: %s", args.config, e)
             return 2
     try:
@@ -2404,13 +2536,15 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", e)
         return 2
 
-    # The central 'veracode' config repo must never receive an override,
-    # even when the user supplies a custom --exclude list (which replaces
-    # the default rather than extending it). Applies in every org.
+    # The central config repo must never receive an override, even when the
+    # user supplies a custom --exclude list (which replaces the default
+    # rather than extending it). Applies in every org; process_org also
+    # checks args.central_repo directly.
     excludes = list(args.exclude)
-    if not matches_any("veracode", excludes):
-        excludes.append("veracode")
-        log.info("Added central 'veracode' repo to excludes automatically.")
+    if not matches_any(args.central_repo, excludes):
+        excludes.append(args.central_repo)
+        log.info("Added central '%s' repo to excludes automatically.",
+                 args.central_repo)
 
     # Resume state is keyed by (org, repo), case-insensitive. Reports from
     # the single-org version carry the org only at the top level; that value
@@ -2419,7 +2553,7 @@ def main(argv: list[str] | None = None) -> int:
     carried: list[dict] = []
     if args.resume_from:
         try:
-            with open(args.resume_from) as f:
+            with open(args.resume_from, encoding="utf-8") as f:
                 prior = json.load(f)
             prior_org = prior.get("org")
             for r in prior.get("repos", []):
@@ -2437,7 +2571,7 @@ def main(argv: list[str] | None = None) -> int:
             log.info("Resume: %d repos with terminal outcomes in %s will be "
                      "skipped and carried into the new report",
                      len(resume_done), args.resume_from)
-        except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
+        except (OSError, ValueError, AttributeError, TypeError) as e:
             log.error("Cannot read --resume-from %s: %s", args.resume_from, e)
             return 2
 
@@ -2483,7 +2617,7 @@ def main(argv: list[str] | None = None) -> int:
         of losing hours of API work."""
         if args.report:
             try:
-                with open(args.report, "w") as f:
+                with open(args.report, "w", encoding="utf-8") as f:
                     json.dump({"org": orgs[0] if len(orgs) == 1 else None,
                                "orgs": orgs,
                                "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ",
@@ -2546,11 +2680,11 @@ def main(argv: list[str] | None = None) -> int:
         for it in items:
             print(f"  {it[0]}: {it[1]}" if isinstance(it, tuple) else f"  {it}")
     print(f"Total GitHub API calls: {gh.api_calls} ({gh.write_calls} writes)")
+    # Exit codes match the sibling bulk tools: 0 ok, 2 any repo or org
+    # failed (or nothing could run), 130 interrupted.
     if interrupted:
         return 130
-    if len(org_errors) == len(orgs):
-        return 2  # nothing could be processed at all
-    return 1 if summary["failed"] else 0
+    return 2 if summary["failed"] or org_errors else 0
 
 
 def _mark_failed(report: list[dict], entry: dict | None, org: str, name: str,

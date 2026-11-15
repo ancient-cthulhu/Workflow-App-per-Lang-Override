@@ -139,7 +139,7 @@ python3 script.py --org my-org --resume-from run1.json --report run2.json
 - **Safe by default.** Default mode opens PRs; nothing is merged automatically.
 - **Your own files are protected.** If a repo already has a hand-written `veracode.yml`, it is skipped (unless you pass `--force`).
 - **Safe to re-run.** Repos already correct are skipped, and existing PRs are reused instead of duplicated.
-- **The central `veracode` repo is always excluded.**
+- **The central `veracode` repo is always excluded** (`--central-repo NAME` if yours is named differently), and so is any repo that looks like a central integration repo.
 - **Archived repos and forks are skipped** unless you add `--include-archived` or `--include-forks`.
 - **Platform policy/sandbox scans are not affected.** Only pipeline scan triggers are changed.
 

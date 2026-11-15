@@ -20,7 +20,7 @@ For each repository the script:
 
 **Managed files.** Every generated file starts with `# managed-by: veracode-scan-scoping`. The tool owns those files (and files from earlier versions that start with `# Detection:`): it updates them when a decision changes and removes them, via PR, once every scan type is relevant again (for example a docs repo that gained code). Hand-written `veracode.yml` files are never modified unless `--force` is passed, and are left alone entirely when no override is needed.
 
-**Idempotent.** A repo is skipped when its existing file already has the same settings. Settings are compared with comments stripped, so a changed reason in the header (a new file in a list, a truncation note) never causes churn or a PR on its own. Open scoping PRs are reused, a scoping PR the repo owners closed is not reopened on every run, and an open scoping PR that a fresh scan no longer justifies is closed.
+**Idempotent.** A repo is skipped when its existing file already has the same settings. Settings are compared with comments stripped, so a changed reason in the header (a new file in a list, a truncation note) never causes churn or a PR on its own. Open scoping PRs are reused, a scoping PR the repo owners closed without merging is not reopened on every run (merged PRs and the tool's own removal PRs never count as declined), and an open scoping PR that a fresh scan no longer justifies (no override needed, the default branch already has the right settings, or a hand-written file it no longer matches) is closed with a short comment.
 
 > **Scan trigger semantics.** The static `push`/`pull_request` triggers control **pipeline** scans only. Platform sandbox and policy scans are governed by `analysis_on_platform` and are independent of these triggers; they are never touched unless `--platform-analysis` is passed explicitly. SCA and IaC scans are fully controlled by their triggers, so disabling them here fully prevents those runs.
 
@@ -70,7 +70,7 @@ Detection is tiered to avoid both false positives (a MAUI app forced onto Window
 |---|---|---|
 | Strong | `packages.config`, `Global.asax`, `*.aspx`/`*.ascx`/`*.asax`/`*.master`/`*.asmx` (WebForms), `*.vcxproj`/`*.vcproj` (MSVC), `.sqlproj`, `.wixproj` | Windows, when the repo also shows .NET/C++ evidence. These artifacts have no portable counterpart. |
 | Weak | `*.xaml`, `web.config`, `app.config`, `*.vbproj`, `*.fsproj` | Never force Windows alone. Each has a Linux-buildable counterpart (MAUI/Avalonia XAML, ASP.NET Core IIS configs, SDK-style VB/F#). They automatically trigger project-file inspection. |
-| Project markers | Inside `.csproj`/`.vbproj`/`.fsproj` contents: `<TargetFrameworkVersion>`, `ToolsVersion`, the msbuild/2003 xmlns (old-style projects), `<UseWPF>`, `<UseWindowsForms>`, `net4x` and `*-windows` target frameworks | Windows when found. Inspection runs automatically for weak-signal repos (up to `--max-project-files`, nearest to the weak signal first, 1 API call each). |
+| Project markers | Inside `.csproj`/`.vbproj`/`.fsproj` contents: `<TargetFrameworkVersion>`, `ToolsVersion`, the msbuild/2003 xmlns (old-style projects), `<UseWPF>`, `<UseWindowsForms>`, `net4x` and `*-windows` target frameworks (anywhere in a `<TargetFramework(s)>` list, attributes allowed; `IsOSPlatform`-conditioned TFMs such as MAUI's are ignored) | Windows when found. Inspection runs automatically for weak-signal repos (up to `--max-project-files`, nearest to the weak signal first, 1 API call each). |
 
 Plain `.cs`, `.csproj`, and `.sln` are deliberately not signals: SDK-style .NET builds on the default Linux runner. `--deep-dotnet` extends project-file inspection to every repo containing project files, catching the zero-surface-signal case of an SDK-style project targeting `net48` or `net8.0-windows`. `--runner off` disables the feature entirely. On truncated trees the runner reason is annotated as best-effort. All signal tiers are `--config` keys, so org-specific conventions can be added without code changes.
 
@@ -172,7 +172,8 @@ python3 script.py --org my-org --resume-from run1.json --report run2.json
 
 At least one of `--org`, `--orgs-file`, `--enterprise` is required. Org names are matched case-insensitively and de-duplicated. Orgs are processed one after another with one shared rate limiter and write budget, since GitHub applies those limits per token, not per org.
 | `--include PATTERN [...]` | `*` | Glob patterns of repos to include (case-insensitive, applied in every org) |
-| `--exclude PATTERN [...]` | `veracode` | Glob patterns of repos to skip. The central `veracode` repo is always excluded in every org. |
+| `--exclude PATTERN [...]` | `veracode` | Glob patterns of repos to skip. The `--central-repo` is always excluded in every org. |
+| `--central-repo NAME` | `veracode` | Central integration repo. Never touched, even with `--force`. Any repo that looks like one (root `veracode.yml` plus `.github/workflows/veracode-*.yml`) is also skipped, as `skipped_central_repo`. |
 | `--include-archived` | off | Otherwise archived repos are skipped |
 | `--include-forks` | off | Otherwise forks are skipped |
 
@@ -186,7 +187,7 @@ Empty and disabled repos are always skipped.
 | `--direct-commit` | off | Commit to the default branch instead of opening a PR |
 | `--branch-name NAME` | `chore/veracode-scan-scoping` | Branch used for the PR flow. A leftover branch with no open PR is reset to the default branch head before reuse. |
 | `--force` | off | Overwrite a hand-written (unmanaged) `veracode.yml`. Managed files are updated without it. |
-| `--reopen-declined` | off | Open a new PR even where a previous scoping PR was closed and the default branch has no managed file. Without it such repos are reported as `pr_declined`. |
+| `--reopen-declined` | off | Open a new PR even where the latest scoping PR was closed without merging and the default branch has no managed file. Without it such repos are reported as `pr_declined`. |
 
 ### Detection Tuning
 
@@ -213,17 +214,17 @@ Empty and disabled repos are always skipped.
 | `--max-writes-per-hour N` | `450` | Rolling hourly cap on write requests, under GitHub's ~500 per hour secondary limit. `0` disables. |
 | `--gh-timeout SECONDS` | `120` | A single `gh` call that exceeds this is abandoned and retried, so one stalled connection cannot hang an org-wide run |
 
-The script checks `/rate_limit` every 50 calls, sleeps until reset when the budget runs low, and backs off exponentially with jitter on secondary rate limit responses and transient errors (5xx, timeouts, resets). Every write path is idempotent on retry: a branch, commit, deletion, or PR that succeeded server-side but failed client-side is recognized as done instead of marking the repo failed. PR mode makes up to 3 writes per repo, so the default hourly cap processes roughly 150 changed repos per hour; unchanged repos cost no writes.
+The script checks `/rate_limit` every 50 calls (both the `core` and `graphql` buckets), sleeps until reset when either budget runs low, and backs off exponentially with jitter on secondary rate limit responses and transient errors (5xx, timeouts, resets). Every write path is idempotent on retry: a branch, commit, deletion, or PR that succeeded server-side but failed client-side is recognized as done instead of marking the repo failed. PR mode makes up to 3 writes per repo, so the default hourly cap processes roughly 150 changed repos per hour; unchanged repos cost no writes.
 
-Language data is prefetched in batches of 40 repos per GraphQL call (disable with `--no-graphql`); any repo missing from a batch, and every repo when the GraphQL endpoint is unhealthy, falls back to its own REST call. Cost is roughly 1 API call per repo (recursive tree) plus 1 per 40 repos (languages), plus 1 when a `veracode.yml` already exists (to read it) and 1 search query per run to find outdated scoping PRs.
+Language data and the root `veracode.yml` (when present) are prefetched in batches of 40 repos per GraphQL call (disable with `--no-graphql`); any repo missing from a batch, and every repo when the GraphQL endpoint is unhealthy, falls back to its own REST calls. Cost is roughly 1 API call per repo (recursive tree) plus 1 per 40 repos (languages and existing files), plus 1 when an existing `veracode.yml` changed between the batch and the tree read (or without GraphQL) and 1 search query per org to find outdated scoping PRs.
 
 ### Output
 
 | Flag | Default | Description |
 |---|---|---|
 | `--report FILE` | none | Write a JSON audit report: per-repo languages, decisions, reasons, full detection evidence, action, and outcome. Written even when the run is interrupted (Ctrl-C) or crashes, with an `interrupted` flag. Failed repos are included with their error. |
-| `--resume-from FILE` | none | Skip repos (matched by org and repo name) that already reached a terminal outcome (`no_change`, `already_correct`, `committed`, `pr_opened`, `skipped_existing_file`, `pr_declined`) in a prior `--report` JSON. Their entries are carried into the new report (`carried_over: true`), so chained resumes stay cumulative. Failed and dry-run outcomes are retried. Reports from the earlier single-org version are accepted. |
-| `--no-graphql` | off | Disable batched GraphQL language prefetching and use one REST call per repo instead |
+| `--resume-from FILE` | none | Skip repos (matched by org and repo name) that already reached a terminal outcome (`no_change`, `already_correct`, `committed`, `pr_opened`, `skipped_existing_file`, `pr_declined`, `skipped_central_repo`) in a prior `--report` JSON. Their entries are carried into the new report (`carried_over: true`), so chained resumes stay cumulative. Failed and dry-run outcomes are retried. Reports from the earlier single-org version are accepted. |
+| `--no-graphql` | off | Disable batched GraphQL prefetching (languages, existing `veracode.yml`) and use REST calls per repo instead |
 | `--csv FILE` | `dry_run_report.csv` on `--dry-run`, off otherwise | Write a flat CSV: one row per repo with outcome, action, scan decisions, reasons, runner, languages, PR URL, and error. |
 | `-v`, `--verbose` | off | Debug-level logging, including the per-scan-type reasoning for every repo |
 
@@ -363,11 +364,15 @@ Total GitHub API calls: 187 (96 writes)
 
 `existing_file` is `managed`, `unmanaged`, or `null`. `action` is `write`, `delete`, or `null`.
 
-`outcome` values: `no_change`, `already_correct`, `would_write` / `would_delete` (dry run), `committed`, `pr_opened` (with `pr_reused` when an open PR was updated), `skipped_existing_file` (hand-written file), `pr_declined`, `failed_branch_creation`, `failed` (with `error`).
+`outcome` values: `no_change`, `already_correct`, `would_write` / `would_delete` (dry run), `committed`, `pr_opened` (with `pr_reused` when an open PR was updated), `skipped_existing_file` (hand-written file), `pr_declined`, `skipped_central_repo`, `failed_branch_creation`, `failed` (with `error`). `stale_pr` is set when an open scoping PR was (or, in a dry run, would be) closed.
 
 ### `--csv` report
 
-Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv FILE` to name it explicitly, or to also get one on an apply run). One row per repo, flattened for review in Excel/Sheets before anything touches GitHub. Columns: `org, repo, default_branch, tree_truncated, outcome, action, existing_file, override_written, sast, sast_reason, sca, sca_reason, iac, iac_reason, runner, runner_reason, languages, pr_url, error, carried_over`.
+Written automatically to `dry_run_report.csv` on every `--dry-run` (pass `--csv FILE` to name it explicitly, or to also get one on an apply run). One row per repo, flattened for review in Excel/Sheets before anything touches GitHub. Columns: `org, repo, default_branch, tree_truncated, outcome, action, existing_file, override_written, sast, sast_reason, sca, sca_reason, iac, iac_reason, runner, runner_reason, languages, pr_url, error, carried_over`. The file is UTF-8 with a BOM (opens correctly in Excel), and cells starting with `=`, `+`, `-`, `@`, tab or CR are prefixed with `'` so repo-controlled text cannot run as a spreadsheet formula.
+
+### Exit codes
+
+`0` every repo and org succeeded, `2` any repo or org failed (or the run could not start: bad flags, auth, config), `130` interrupted. Same convention as the sibling bulk tools.
 
 -----
 
