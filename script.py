@@ -852,7 +852,7 @@ class ScanDecision:
 # NEL, LS and PS as line breaks, so they must not reach a comment line; bidi
 # controls can make a PR body or log line read differently than it is.
 _CTRL_CHARS = re.compile(
-    "[\x00-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩﻿]+")
+    "[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]+")
 
 
 def sanitize(s: str) -> str:
