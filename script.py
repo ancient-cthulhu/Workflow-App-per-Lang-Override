@@ -38,15 +38,13 @@ log = logging.getLogger("veracode-provision")
 
 # ---------------------------------------------------------------------------
 # Detection matrices
-# Verified against the Veracode GitHub Workflow Integration docs (checked 2026-11; 
-# Integration page last updated 2026-10-22):
+# Verified against the Veracode GitHub Workflow Integration docs (2026-07,
+# re-checked 2026-11; integration page last updated 2026-10-22):
 # https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning
-# 
 # Pipeline Scan languages (page updated 2026-03-25):
 # https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages
 # and SCA agent support matrix:
 # https://docs.veracode.com/r/Agent_Based_Scans
-# 
 # Known documentation conflicts (left fail-open on purpose, see README):
 #   - the integration's language table lists PHP with SAST "No";
 #   - the autopackaging page lists the GitHub integration autopackager as
