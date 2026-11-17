@@ -26,6 +26,7 @@ import logging
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -37,10 +38,22 @@ log = logging.getLogger("veracode-provision")
 
 # ---------------------------------------------------------------------------
 # Detection matrices
-# Verified against the Veracode GitHub Workflow Integration docs (2026-07):
+# Verified against the Veracode GitHub Workflow Integration docs (checked 2026-11; 
+# Integration page last updated 2026-10-22):
 # https://docs.veracode.com/r/GitHub_Workflow_Integration_for_Repo_Scanning
-# and SCA agent support:
-# https://docs.veracode.com/r/Using_Veracode_SCA_with_Programming_Languages/
+# 
+# Pipeline Scan languages (page updated 2026-03-25):
+# https://docs.veracode.com/r/Pipeline_Scan_Supported_Languages
+# and SCA agent support matrix:
+# https://docs.veracode.com/r/Agent_Based_Scans
+# 
+# Known documentation conflicts (left fail-open on purpose, see README):
+#   - the integration's language table lists PHP with SAST "No";
+#   - the autopackaging page lists the GitHub integration autopackager as
+#     Java, JavaScript, Python, Go, Scala, Kotlin, React Native and Android
+#     only, while the integration table marks .NET and Ruby SAST "Yes".
+#   Moving a language to a disable tier is one --config line when an org
+#   confirms the integration cannot build it.
 # All of these can be overridden with --config (JSON with the same key names)
 # so the script stays correct as Veracode expands support.
 # ---------------------------------------------------------------------------
@@ -121,6 +134,7 @@ DEFAULT_MATRICES: dict = {
         ".java": "Java", ".jsp": "Java", ".groovy": "Groovy",
         ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
         ".jsx": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
+        ".mts": "TypeScript", ".cts": "TypeScript",
         ".vue": "Vue", ".svelte": "Svelte",
         ".kt": "Kotlin", ".kts": "Kotlin",
         ".py": "Python",
@@ -167,8 +181,10 @@ DEFAULT_MATRICES: dict = {
         # JavaScript/TypeScript: NPM, Yarn, pnpm, Bower
         "package.json", "package-lock.json", "npm-shrinkwrap.json",
         "yarn.lock", "bower.json", "pnpm-lock.yaml", "pnpm-workspace.yaml",
-        # Python: pip, Pipenv, Poetry, uv, PDM (requirements*.txt also
-        # matched by rule)
+        # Python: pip, Pipenv, Poetry (agent matrix). uv.lock / pdm.lock are
+        # not agent package managers; they are kept as detection evidence
+        # because such projects also carry pyproject.toml (fail-open).
+        # requirements*.txt is also matched by rule.
         "requirements.txt", "pipfile", "pipfile.lock", "pyproject.toml",
         "setup.py", "setup.cfg", "poetry.lock", "uv.lock", "pdm.lock",
         # Go: Go modules/workspaces, Dep, Glide, GoDep, GoVendor, Trash
@@ -187,12 +203,20 @@ DEFAULT_MATRICES: dict = {
         "podfile", "podfile.lock",
         # C/C++: Make
         "makefile", "gnumakefile",
+        # Reported only (no integration or agent support): Rust, Swift
+        # Package Manager, Carthage, Elixir, Dart/Flutter pub, Conan, vcpkg,
+        # Bun. Listing them makes the report say "found but unsupported"
+        # instead of silently ignoring the ecosystem.
+        "cargo.toml", "cargo.lock", "package.swift", "package.resolved",
+        "cartfile", "cartfile.resolved", "mix.exs", "mix.lock",
+        "pubspec.yaml", "pubspec.lock", "conanfile.txt", "conanfile.py",
+        "vcpkg.json", "bun.lockb", "bun.lock",
     ],
     # Manifest suffixes (lowercase). .jar/.dll covered by the agent's
     # "Jars"/"DLL" hash-based quick scan rows, so vendored-binary repos count.
     # .sbt covers plugins.sbt and other sbt build definitions.
     "SCA_MANIFEST_SUFFIXES": [".csproj", ".fsproj", ".vbproj", ".sln",
-                              ".nuspec", ".jar", ".dll", ".sbt"],
+                              ".slnx", ".nuspec", ".jar", ".dll", ".sbt"],
     # Build-support files that belong to an ecosystem but do not declare a
     # resolvable dependency tree on their own. They are reported and count
     # toward pairing, but never enable SCA alone: a repo whose only .NET file
@@ -203,7 +227,7 @@ DEFAULT_MATRICES: dict = {
         "gradlew", "mvnw", "libs.versions.toml", "setup.cfg",
         "pnpm-workspace.yaml", "go.work.sum",
     ],
-    "SCA_SUPPORTING_SUFFIXES": [".sln"],
+    "SCA_SUPPORTING_SUFFIXES": [".sln", ".slnx"],
     # Basenames never treated as dependency evidence. Build-tool wrapper jars
     # ship with every Gradle/Maven project (including React Native and
     # Flutter android/ folders) and are not application dependencies.
@@ -260,7 +284,7 @@ DEFAULT_MATRICES: dict = {
                       "directory.build.props", "directory.packages.props",
                       "global.json"],
             "suffixes": [".csproj", ".fsproj", ".vbproj", ".sln",
-                         ".nuspec", ".dll"],
+                         ".slnx", ".nuspec", ".dll"],
         },
     },
     # IaC / container / secrets scan signals. Exact lowercase basenames.
@@ -275,12 +299,20 @@ DEFAULT_MATRICES: dict = {
         "template.yaml", "template.yml",
         "cdk.json", "pulumi.yaml", "pulumi.yml",
         "ansible.cfg", "vagrantfile",
-        "crossplane.yaml",
+        "crossplane.yaml", "chart.lock", "values.yml",
     ],
-    "IAC_FILE_SUFFIXES": [".tf", ".tf.json", ".tfvars", ".hcl", ".bicep"],
-    "IAC_NAME_PREFIXES": ["dockerfile", "docker-compose"],
-    # Directory prefixes (lowercase, with trailing slash) where YAML/JSON is
-    # treated as IaC.
+    "IAC_FILE_SUFFIXES": [".tf", ".tf.json", ".tfvars", ".hcl", ".bicep",
+                          ".bicepparam", ".dockerfile", ".containerfile",
+                          ".cfn.yaml", ".cfn.yml", ".cfn.json"],
+    # Basename prefixes: Dockerfile.prod, docker-compose.override.yml,
+    # Containerfile.dev, Pulumi.<stack>.yaml, helmfile.yaml/helmfile.d.
+    "IAC_NAME_PREFIXES": ["dockerfile", "docker-compose", "containerfile",
+                          "pulumi.", "helmfile"],
+    # Directory names where YAML/JSON is treated as IaC. Matched at ANY
+    # depth (services/api/k8s/deploy.yaml), so monorepo layouts count. An
+    # entry containing a slash ("platform/envs/") matches that consecutive
+    # directory sequence anywhere in the path. Over-matching only keeps the
+    # IaC scan on (fail-open); it matters only with --iac artifacts.
     "IAC_DIR_HINTS": [
         "terraform/", "infra/", "infrastructure/", "iac/",
         "k8s/", "kubernetes/", "kube/", "helm/", "charts/", "manifests/",
@@ -290,7 +322,8 @@ DEFAULT_MATRICES: dict = {
         "docker/",
     ],
     # Linguist languages that directly indicate IaC content.
-    "IAC_LANGUAGES": ["HCL", "Dockerfile", "Bicep", "Smarty", "Open Policy Agent"],
+    "IAC_LANGUAGES": ["HCL", "Dockerfile", "Bicep", "Smarty", "Open Policy Agent",
+                      "Terraform Template"],
     # Windows runner detection ("default: runs_on: windows-latest").
     # Modern SDK-style .NET builds on the default Linux runner, so plain
     # .cs/.csproj/.sln is NOT a signal. Signals are tiered:
@@ -314,7 +347,11 @@ DEFAULT_MATRICES: dict = {
     "WINDOWS_FILE_SUFFIXES": [".vcxproj", ".vcproj", ".aspx", ".ascx",
                               ".asax", ".master", ".asmx", ".sqlproj",
                               ".wixproj"],
-    "WINDOWS_WEAK_FILE_NAMES": ["app.xaml", "web.config", "app.config"],
+    # assemblyinfo.cs/.vb: hand-maintained assembly attributes are the norm
+    # in old-style (non-SDK) projects, which SDK-style projects generate.
+    # Weak only: SDK projects with GenerateAssemblyInfo=false keep one too.
+    "WINDOWS_WEAK_FILE_NAMES": ["app.xaml", "web.config", "app.config",
+                                "assemblyinfo.cs", "assemblyinfo.vb"],
     "WINDOWS_WEAK_FILE_SUFFIXES": [".xaml", ".vbproj", ".fsproj"],
     "WINDOWS_PROJECT_MARKERS": [
         "<targetframeworkversion>",          # old-style Framework project
@@ -331,8 +368,11 @@ DEFAULT_MATRICES: dict = {
     # onto a Windows runner. Attributes (Condition=...) are allowed, except
     # IsOSPlatform conditions: the MAUI template adds its -windows TFM only
     # when building ON Windows, so the project still builds on Linux.
+    # .NET Framework TFMs are net11, net20, net35 and net4x (no dot); modern
+    # TFMs always have a dot (net5.0 ... net10.0, net11.0), so the trailing
+    # (?!\.) keeps .NET 11 ("net11.0") from matching Framework 1.1.
     "WINDOWS_TFM_REGEX": (r"<targetframeworks?(?:\s(?![^>]*isosplatform)[^>]*)?>"
-                          r"[^<]*(?:-windows|\bnet4\d)"),
+                          r"[^<]*(?:-windows|\bnet(?:11|20|35|4\d{1,2})\b(?!\.))"),
     # Strong Windows file signals only take effect when the repo shows
     # .NET/C++ evidence (language or project files). Without this gate a
     # stray sample .aspx or a file named *.master in a Python or Java repo
@@ -371,7 +411,8 @@ DEFAULT_MATRICES: dict = {
     "GENERATED_FILE_SUFFIXES": [".min.js", ".bundle.js", ".chunk.js",
                                 ".min.mjs", ".pb.go", "_pb2.py", ".g.cs",
                                 ".designer.cs", ".generated.cs",
-                                ".d.ts", ".pb.cc", ".pb.h", "_pb.js"],
+                                ".d.ts", ".d.mts", ".d.cts", ".pb.cc",
+                                ".pb.h", "_pb.js"],
     # Build-tool configuration files excluded from language classification.
     # A repo whose only .js/.ts files are these is not a JavaScript project
     # (docs sites, Python repos with frontend tooling). Linguist does NOT
@@ -411,9 +452,10 @@ DEFAULT_MATRICES: dict = {
         "eslint.config", "commitlint.config", "stylelint.config",
         "tsup.config", "astro.config",
     ],
-    # Framework scaffolding: when the ROOT marker file exists, the listed
-    # top-level directories hold generated platform runners, not first-party
-    # code, and are excluded from language classification (Linguist bytes
+    # Framework scaffolding: when a marker file exists (at the root or in a
+    # monorepo sub-directory), the listed sibling directories hold generated
+    # platform runners, not first-party code, and are excluded
+    # from language classification (Linguist bytes
     # are subtracted), SCA manifest detection, and Windows signals. A
     # `flutter create` app otherwise shows ~20 KB of C++ (windows/, linux/),
     # Swift (ios/, macos/), Kotlin and a Gradle build (android/) that needs
@@ -500,12 +542,67 @@ def is_managed(text: str) -> bool:
 # Rate-limit-aware gh CLI wrapper
 # ---------------------------------------------------------------------------
 
+def _short_cmd(cmd: list[str], limit: int = 120) -> str:
+    """Command line for error messages and logs, with long values (base64
+    file content, PR bodies, GraphQL queries) elided. Keeps reports and logs
+    readable and avoids copying payloads into them."""
+    out = []
+    for a in cmd:
+        if len(a) > limit:
+            key, eq, _ = a.partition("=")
+            a = (f"{key}=<{len(a) - len(key) - 1} chars>" if eq and len(key) < 40
+                 else f"<{len(a)} chars>")
+        out.append(a)
+    return " ".join(out)
+
+
 class GhError(RuntimeError):
     def __init__(self, cmd: list[str], returncode: int, stderr: str,
                  stdout: str = ""):
         self.cmd, self.returncode, self.stderr = cmd, returncode, stderr
         self.stdout = stdout  # gh api graphql prints partial data here
-        super().__init__(f"gh failed ({returncode}): {' '.join(cmd)}\n{stderr.strip()}")
+        super().__init__(f"gh failed ({returncode}): {_short_cmd(cmd)}\n"
+                         f"{stderr.strip()[:400]}")
+
+
+class GhAuthError(GhError):
+    """The token is missing, expired or revoked (HTTP 401). Fatal for the
+    whole run: every further call would fail the same way."""
+
+
+class ReadOnlyViolation(RuntimeError):
+    """A write was attempted on a read-only (--dry-run) client."""
+
+
+# Error categories recorded in reports (error_category) so administrators
+# can act on failures in bulk instead of reading every message.
+_ERROR_PATTERNS = (
+    ("auth", r"\bhttp 401\b|bad credentials|requires authentication|gh auth login"),
+    ("rate_limit", r"secondary rate limit|abuse detection|\bhttp 429\b|"
+                   r"api rate limit exceeded|rate.limited"),
+    ("protected_branch", r"protected branch|must be made through a pull request|"
+                         r"rule violations?|required status check"),
+    ("permission", r"\bhttp 403\b|saml|not accessible by|must have (?:admin|push)"),
+    ("not_found", r"\bhttp 404\b"),
+    ("conflict", r"\bhttp 409\b|does not match|is at [0-9a-f]+ but expected"),
+    ("validation", r"\bhttp 422\b"),
+    ("timeout", r"timed out|timeout"),
+    ("transient", r"\bhttp 5\d\d\b|connection reset|connection refused|"
+                  r"temporarily unavailable|bad gateway|service unavailable|"
+                  r"unexpected eof|tls handshake"),
+)
+
+
+def classify_error(exc: BaseException) -> str:
+    if isinstance(exc, GhError):
+        text = exc.stderr.lower()
+        for category, pattern in _ERROR_PATTERNS:
+            if re.search(pattern, text):
+                return category
+        return "unknown"
+    if isinstance(exc, ReadOnlyViolation):
+        return "dry_run_guard"
+    return "unexpected"
 
 
 class GhClient:
@@ -518,13 +615,18 @@ class GhClient:
       makes up to 3 writes per repo. Without pacing an org-wide rollout
       hits the hourly cap, backs off for ~20 minutes, and marks repos
       failed while the window is still closed.
-    - Every `check_every` calls, queries /rate_limit and sleeps until reset
-      if core remaining drops below `min_remaining`.
+    - Every `check_every` calls (REST, GraphQL and `gh pr`), queries
+      /rate_limit and sleeps until reset if the core or GraphQL budget drops
+      below `min_remaining`. A 404 from /rate_limit (GHES with rate limiting
+      disabled) turns the check off instead of repeating it all run.
     - Every gh invocation has a timeout, so one stalled connection cannot
       hang an org-wide run. Timeouts are retried like transient errors;
-      every write path in this script is idempotent on retry.
+      every write path in this script reconciles remote state on retry.
     - Exponential backoff with jitter on secondary rate limit / abuse
       detection responses and transient network errors.
+    - HTTP 401 raises GhAuthError immediately (never retried).
+    - read_only=True (dry runs) refuses every write before it is sent, so
+      a logic error can never modify a repository during an audit.
     """
 
     TRANSIENT_RE = re.compile(
@@ -533,13 +635,14 @@ class GhClient:
         r"service unavailable|unexpected eof|tls handshake")
     SECONDARY_RE = re.compile(
         r"secondary rate limit|abuse detection|\bhttp 429\b")
+    AUTH_RE = re.compile(r"\bhttp 401\b|bad credentials|requires authentication")
     PRIMARY_MARKERS = ("api rate limit exceeded",)
     WRITE_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
     def __init__(self, min_interval: float = 0.25, min_remaining: int = 100,
                  check_every: int = 50, max_retries: int = 6,
                  timeout: float = 120.0, write_interval: float = 1.0,
-                 writes_per_hour: int = 450):
+                 writes_per_hour: int = 450, read_only: bool = False):
         self.min_interval = min_interval
         self.min_remaining = min_remaining
         self.check_every = check_every
@@ -547,12 +650,16 @@ class GhClient:
         self.timeout = timeout
         self.write_interval = write_interval
         self.writes_per_hour = writes_per_hour
+        self.read_only = read_only
         self._last_call = 0.0
         self._last_write = 0.0
         self._write_times: deque[float] = deque()
         self._calls_since_check = 0
+        self._rate_limit_supported = True
         self.api_calls = 0
         self.write_calls = 0
+        self.retries = 0
+        self.wait_seconds = 0.0
 
     @classmethod
     def is_write(cls, args: list[str]) -> bool:
@@ -562,6 +669,10 @@ class GhClient:
             if a in ("-X", "--method") and args[i + 1].upper() in cls.WRITE_METHODS:
                 return True
         return False
+
+    def _sleep(self, seconds: float) -> None:
+        self.wait_seconds += seconds
+        time.sleep(seconds)
 
     def _throttle(self) -> None:
         wait = self.min_interval - (time.monotonic() - self._last_call)
@@ -578,7 +689,7 @@ class GhClient:
             log.warning("Write budget of %d/hour reached (GitHub secondary "
                         "limit hygiene). Sleeping %.0fs.", self.writes_per_hour,
                         sleep_for)
-            time.sleep(sleep_for)
+            self._sleep(sleep_for)
             self._write_times.popleft()
         wait = self.write_interval - (time.monotonic() - self._last_write)
         if wait > 0:
@@ -588,6 +699,8 @@ class GhClient:
         self.write_calls += 1
 
     def _maybe_check_rate_limit(self) -> None:
+        if not self._rate_limit_supported or self.check_every <= 0:
+            return
         self._calls_since_check += 1
         if self._calls_since_check < self.check_every:
             return
@@ -611,14 +724,26 @@ class GhClient:
                                 remaining)
             if sleep_for:
                 log.warning("Sleeping %.0fs until reset.", sleep_for)
-                time.sleep(sleep_for)
+                self._sleep(sleep_for)
+        except GhError as e:
+            if re.search(r"\bhttp 404\b", e.stderr.lower()):
+                self._rate_limit_supported = False
+                log.info("Rate-limit endpoint not available (GHES with rate "
+                         "limiting disabled?); periodic checks turned off.")
+            else:
+                log.debug("rate_limit check failed, continuing: %s", e)
         except Exception as e:  # never let the health check kill the run
             log.debug("rate_limit check failed, continuing: %s", e)
 
     def _run_once(self, args: list[str]) -> str:
-        self._throttle()
         if self.is_write(args):
+            if self.read_only:
+                raise ReadOnlyViolation(
+                    f"dry run: refusing write {_short_cmd(['gh'] + args)}")
+            self._throttle()
             self._pace_write()
+        else:
+            self._throttle()
         self.api_calls += 1
         try:
             proc = subprocess.run(["gh"] + args, capture_output=True, text=True,
@@ -629,18 +754,23 @@ class GhClient:
                           f"gh timed out after {self.timeout:.0f}s", out)
         if proc.returncode == 0:
             return proc.stdout
-        raise GhError(["gh"] + args, proc.returncode, proc.stderr or "",
-                      proc.stdout or "")
+        stderr = proc.stderr or ""
+        cls = GhAuthError if self.AUTH_RE.search(stderr.lower()) else GhError
+        raise cls(["gh"] + args, proc.returncode, stderr, proc.stdout or "")
 
-    def run(self, args: list[str], ok_statuses: tuple[int, ...] = ()) -> str:
-        """Run a gh command. ok_statuses (e.g. 404) return "" instead of raising."""
-        is_api = args and args[0] == "api"
-        if is_api:
+    def run(self, args: list[str], ok_statuses: tuple[int, ...] = (),
+            max_retries: int | None = None) -> str:
+        """Run a gh command. ok_statuses (e.g. 404) return "" instead of
+        raising. max_retries overrides the client default for this call."""
+        if args[:2] != ["auth", "status"]:
             self._maybe_check_rate_limit()
+        tries = max_retries or self.max_retries
         last: GhError | None = None
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, tries + 1):
             try:
                 return self._run_once(args)
+            except GhAuthError:
+                raise
             except GhError as e:
                 last = e
                 stderr = e.stderr.lower()
@@ -650,30 +780,42 @@ class GhClient:
                     # errors whose message merely contained the number.
                     if re.search(rf"\bhttp {status}\b", stderr):
                         log.debug("Treating HTTP %s as absence: %s",
-                                  status, " ".join(e.cmd))
+                                  status, _short_cmd(e.cmd))
                         return ""
+                retryable = bool(self.SECONDARY_RE.search(stderr)
+                                 or any(m in stderr for m in self.PRIMARY_MARKERS)
+                                 or self.TRANSIENT_RE.search(stderr))
+                if not retryable:
+                    raise  # callers inspect the original stderr (409/422...)
+                if attempt >= tries:
+                    break
                 if self.SECONDARY_RE.search(stderr):
                     wait = min(60 * attempt, 300) + random.uniform(0, 10)
                     log.warning("Secondary rate limit hit. Backing off %.0fs "
-                                "(attempt %d/%d).", wait, attempt, self.max_retries)
-                    time.sleep(wait)
+                                "(attempt %d/%d).", wait, attempt, tries)
+                    self.retries += 1
+                    self._sleep(wait)
                     continue
                 if any(m in stderr for m in self.PRIMARY_MARKERS):
                     log.warning("Primary rate limit exhausted. Sleeping 60s and "
                                 "re-checking.")
-                    time.sleep(60)
+                    self.retries += 1
+                    self._sleep(60)
                     self._calls_since_check = self.check_every  # force check
                     self._maybe_check_rate_limit()
                     continue
-                if self.TRANSIENT_RE.search(stderr) and attempt < self.max_retries:
-                    wait = min(2 ** attempt, 30) + random.uniform(0, 2)
-                    log.warning("Transient error, retrying in %.0fs: %s",
-                                wait, e.stderr.strip()[:150])
-                    time.sleep(wait)
-                    continue
-                raise
-        raise GhError(["gh"] + args, -1, "retries exhausted; last error: "
-                      + (last.stderr.strip()[:300] if last else ""))
+                wait = min(2 ** attempt, 30) + random.uniform(0, 2)
+                log.warning("Transient error, retrying in %.0fs (attempt "
+                            "%d/%d): %s", wait, attempt, tries,
+                            e.stderr.strip()[:150])
+                self.retries += 1
+                self._sleep(wait)
+        assert last is not None
+        if tries == 1:
+            raise last
+        raise GhError(last.cmd, last.returncode,
+                      f"retries exhausted after {tries} attempts; last error: "
+                      + last.stderr.strip()[:300], last.stdout)
 
     def json(self, args: list[str], **kw):
         out = self.run(args, **kw)
@@ -707,7 +849,12 @@ class ScanDecision:
     evidence: dict = field(default_factory=dict)
 
 
-_CTRL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+# C0/C1 controls (incl. NEL \x85), Unicode line/paragraph separators, and
+# bidirectional overrides/isolates ("Trojan Source"). YAML 1.1 parsers treat
+# NEL, LS and PS as line breaks, so they must not reach a comment line; bidi
+# controls can make a PR body or log line read differently than it is.
+_CTRL_CHARS = re.compile(
+    "[\x00-\x1f\x7f-\x9f‎‏‪-‮⁦-⁩﻿]+")
 
 
 def sanitize(s: str) -> str:
@@ -720,13 +867,72 @@ def sanitize(s: str) -> str:
     return _CTRL_CHARS.sub(" ", s)
 
 
-def list_org_repos(gh: GhClient, org: str) -> list[dict]:
-    """Paginated org repo listing. No arbitrary ceiling."""
-    out = gh.run(["api", "--paginate", f"orgs/{org}/repos?per_page=100&type=all",
-                  "--jq", '.[] | {name, default_branch, archived, fork, size, disabled}'])
-    repos = [json.loads(line) for line in out.splitlines() if line.strip()]
-    log.info("Listed %d repos in %s (%d API pages)", len(repos), org,
-             max(1, (len(repos) + 99) // 100))
+# Report evidence lists are capped so a repo with thousands of matching
+# files (k8s manifests, vendored jars) cannot bloat the JSON report; the
+# true count is recorded next to the capped list.
+EVIDENCE_CAP = 200
+
+# User-supplied identifiers end up in API paths and search queries. GitHub
+# logins/slugs are alphanumeric plus hyphens (GHES may allow '_' and '.');
+# anything with '/', '?', '%', '..' or a leading '-' could redirect a REST
+# path (orgs/x/../..), smuggle query parameters, or be read by gh as a flag.
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}\Z")
+
+
+def valid_login(name: str) -> bool:
+    return bool(_LOGIN_RE.match(name)) and ".." not in name
+
+
+_BAD_REF_CHARS = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def valid_branch_name(name: str) -> bool:
+    """Subset of `git check-ref-format --branch`, plus no leading '-' so the
+    value can never be parsed as a gh/git option."""
+    if not name or len(name) > 200 or name == "@" or "@{" in name:
+        return False
+    if _BAD_REF_CHARS.search(name) or ".." in name or "//" in name:
+        return False
+    if name.startswith(("-", "/")) or name.endswith(("/", ".")):
+        return False
+    return not any(c.startswith(".") or c.endswith(".lock")
+                   for c in name.split("/"))
+
+
+_REPO_FIELDS = ("name", "default_branch", "archived", "fork", "size", "disabled")
+
+
+def list_org_repos(gh: GhClient, org: str, page_size: int = 100) -> list[dict]:
+    """Org repo listing, one gh call per page. No arbitrary ceiling.
+
+    A single `gh api --paginate` call ran every page inside one subprocess
+    under one --gh-timeout: a 20k-repo org (200 pages) exceeded it, the
+    retry restarted from page 1, and the whole org was reported as
+    unlistable. Per-page calls are individually timed, throttled, counted
+    and retried. Sorting by creation date ascending keeps pages stable
+    while repos are being created during the listing (new repos land on the
+    last page); names are de-duplicated in case of a concurrent delete."""
+    repos: list[dict] = []
+    seen: set[str] = set()
+    page = 1
+    while True:
+        data = gh.json(["api", f"orgs/{org}/repos?per_page={page_size}"
+                               f"&type=all&sort=created&direction=asc&page={page}"])
+        if data is None:
+            data = []
+        if not isinstance(data, list):
+            raise GhError(["gh", "api", f"orgs/{org}/repos"], -1,
+                          f"unexpected repo listing payload on page {page}")
+        for r in data:
+            name = (r or {}).get("name") if isinstance(r, dict) else None
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            repos.append({k: r.get(k) for k in _REPO_FIELDS})
+        if len(data) < page_size:
+            break
+        page += 1
+    log.info("Listed %d repos in %s (%d API pages)", len(repos), org, page)
     return repos
 
 
@@ -800,6 +1006,9 @@ def list_enterprise_orgs(gh: GhClient, enterprise: str,
             login = (node or {}).get("login")
             if not login:
                 hidden += 1
+            elif not valid_login(login):
+                log.warning("Skipping enterprise org with an unexpected login "
+                            "format: %r", sanitize(login))
             elif login.lower() not in seen:
                 seen.add(login.lower())
                 orgs.append(login)
@@ -841,6 +1050,10 @@ def resolve_orgs(gh: GhClient, args) -> list[str]:
         if not from_file:
             raise OrgDiscoveryError(f"--orgs-file {args.orgs_file} has no org names")
         explicit += from_file
+    bad = [o for o in explicit if not valid_login(o)]
+    if bad:
+        raise OrgDiscoveryError("Invalid organization login(s): "
+                                + ", ".join(repr(sanitize(o)) for o in bad[:5]))
     explicit = dedupe_orgs(explicit)
     if not args.enterprise:
         return explicit
@@ -866,7 +1079,8 @@ def fetch_languages(gh: GhClient, org: str, repo: str) -> dict[str, int]:
 
 def _parse_language_batch(payload: dict, group: list[str],
                           out: dict[str, dict[str, int]],
-                          blobs: dict[str, tuple[str, str]] | None = None) -> None:
+                          blobs: dict[str, tuple[str, str]] | None = None,
+                          empties: set[str] | None = None) -> None:
     for j, n in enumerate(group):
         node = payload.get(f"r{j}")
         if not isinstance(node, dict):
@@ -877,15 +1091,21 @@ def _parse_language_batch(payload: dict, group: list[str],
             if lang:
                 langs[lang] = langs.get(lang, 0) + int(edge.get("size") or 0)
         out[n] = langs
+        if empties is not None and node.get("isEmpty") is True:
+            empties.add(n)
         blob = node.get("veracodeYml")
         if blobs is not None and isinstance(blob, dict) and blob.get("oid") \
                 and isinstance(blob.get("text"), str) and not blob.get("isTruncated"):
             blobs[n] = (blob["oid"], blob["text"].lstrip(chr(0xFEFF)))
 
 
+GRAPHQL_MIN_SPLIT = 10  # batches larger than this are halved on failure
+
+
 def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
                           chunk: int = 40,
-                          blobs: dict[str, tuple[str, str]] | None = None
+                          blobs: dict[str, tuple[str, str]] | None = None,
+                          empties: set[str] | None = None
                           ) -> dict[str, dict[str, int]]:
     """Fetch language data for many repos per API call via aliased GraphQL
     queries, instead of one REST call per repo. For a 20k-repo org this is
@@ -899,44 +1119,70 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
     still prints the partial data body to stdout, so per-repo errors inside
     an otherwise good batch are salvaged rather than discarding the chunk.
 
+    A batch that fails outright (GraphQL timeouts on large repos surface as
+    HTTP 502) is split in half and retried, down to GRAPHQL_MIN_SPLIT repos,
+    before its repos are left to REST. Two consecutive failures at the
+    minimum size disable batching for the rest of the org.
+
     With `blobs`, the root veracode.yml at HEAD (oid + text) is fetched in
     the same query and stored per repo; the caller uses it only when the
-    oid equals the tree's blob sha, else falls back to the REST blob read."""
+    oid equals the tree's blob sha, else falls back to the REST blob read.
+    With `empties`, names whose repository has no commits are collected
+    (GitHub's REST `size` is 0 until an hourly job runs, so it cannot tell
+    a fresh repo from an empty one)."""
     out: dict[str, dict[str, int]] = {}
-    blob_field = ("veracodeYml: object(expression: \"HEAD:veracode.yml\") "
-                  "{ ... on Blob { oid text isTruncated } } "
-                  if blobs is not None else "")
+    extra = ""
+    if blobs is not None:
+        extra += ("veracodeYml: object(expression: \"HEAD:veracode.yml\") "
+                  "{ ... on Blob { oid text isTruncated } } ")
+    if empties is not None:
+        extra += "isEmpty "
     hard_failures = 0
-    for i in range(0, len(names), chunk):
+    queue: deque[list[str]] = deque(names[i:i + chunk]
+                                    for i in range(0, len(names), chunk))
+    while queue:
         if hard_failures >= 2:
             # GraphQL endpoint is unhealthy; each failed chunk costs a full
             # retry ladder. Stop probing and let every remaining repo use
             # the per-repo REST path instead.
             log.warning("GraphQL batching disabled after %d consecutive "
                         "failures; remaining %d repos use REST.",
-                        hard_failures, len(names) - i)
+                        hard_failures, sum(len(g) for g in queue))
             break
-        group = names[i:i + chunk]
+        group = queue.popleft()
         parts = [
             f"r{j}: repository(owner: {json.dumps(org)}, name: {json.dumps(n)}) "
             # Explicit SIZE DESC order: the schema defines no default order,
             # so a plain first:N could drop the dominant language on repos
             # with many small ones. 100 matches the REST endpoint's output.
             "{ languages(first: 100, orderBy: {field: SIZE, direction: DESC}) "
-            "{ edges { size node { name } } } " + blob_field + "}"
+            "{ edges { size node { name } } } " + extra + "}"
             for j, n in enumerate(group)
         ]
         query = "query { " + " ".join(parts) + " }"
+        splittable = len(group) > GRAPHQL_MIN_SPLIT
         try:
-            data = gh.json(["api", "graphql", "-f", f"query={query}"])
+            # A splittable batch gets a short retry ladder: halving it is a
+            # better remedy for a server-side timeout than resending it.
+            data = gh.json(["api", "graphql", "-f", f"query={query}"],
+                           max_retries=2 if splittable else None)
             payload = (data or {}).get("data") or {}
             hard_failures = 0
+        except GhAuthError:
+            raise
         except GhError as e:
             try:
                 payload = (json.loads(e.stdout) or {}).get("data") or {}
             except (json.JSONDecodeError, AttributeError):
                 payload = {}
             if not payload:
+                if splittable:
+                    half = len(group) // 2
+                    queue.appendleft(group[half:])
+                    queue.appendleft(group[:half])
+                    log.info("GraphQL batch of %d failed, retrying as two "
+                             "batches: %s", len(group), e.stderr.strip()[:150])
+                    continue
                 hard_failures += 1
                 log.warning("GraphQL language batch failed (%d repos fall "
                             "back to REST): %s", len(group),
@@ -950,13 +1196,15 @@ def batch_fetch_languages(gh: GhClient, org: str, names: list[str],
             log.warning("GraphQL batch returned unparseable data, %d repos "
                         "fall back to REST", len(group))
             continue
-        _parse_language_batch(payload, group, out, blobs)
+        _parse_language_batch(payload, group, out, blobs, empties)
     return out
 
 
-def fetch_tree(gh: GhClient, org: str, repo: str, branch: str,
-               recursive: bool = True) -> tuple[list[dict], bool]:
-    url = f"repos/{org}/{repo}/git/trees/{quote(branch, safe='')}"
+def _fetch_tree_raw(gh: GhClient, org: str, repo: str, ref: str,
+                    recursive: bool) -> tuple[list[dict], bool]:
+    """All tree entries (blobs, trees, submodule commits) for a ref or tree
+    sha. 409 (empty repository) returns no entries; 404 fails the repo."""
+    url = f"repos/{org}/{repo}/git/trees/{quote(ref, safe='')}"
     if recursive:
         url += "?recursive=1"
     # 409 = empty repository, a real absence. 404 is NOT treated as absence:
@@ -965,20 +1213,82 @@ def fetch_tree(gh: GhClient, org: str, repo: str, branch: str,
     # real manifests (fail-closed), so it now fails the repo instead.
     try:
         data = gh.json(["api", url], ok_statuses=(409,))
+    except GhAuthError:
+        raise
     except GhError as e:
         if re.search(r"\bhttp 404\b", e.stderr.lower()):
             raise GhError(e.cmd, e.returncode,
                           "git tree not readable (HTTP 404); refusing to decide "
                           "scans without file evidence", e.stdout) from e
         raise
-    if not data:
+    if not isinstance(data, dict):
         return [], False
-    entries = [e for e in data.get("tree", []) if e.get("type") == "blob"]
-    return entries, bool(data.get("truncated"))
+    return list(data.get("tree") or []), bool(data.get("truncated"))
+
+
+def fetch_tree(gh: GhClient, org: str, repo: str, branch: str,
+               recursive: bool = True) -> tuple[list[dict], bool]:
+    entries, truncated = _fetch_tree_raw(gh, org, repo, branch, recursive)
+    return [e for e in entries if e.get("type") == "blob"], truncated
+
+
+def complete_truncated_tree(gh: GhClient, org: str, repo: str,
+                            partial: list[dict], max_fetches: int
+                            ) -> tuple[list[dict], bool]:
+    """Rebuild a full blob listing after the recursive tree API truncated
+    (100,000 entries / 7 MB). Starts from the root listing and fetches each
+    top-level directory's subtree recursively by sha; a subtree that is
+    itself truncated is descended one level at a time. Bounded by
+    max_fetches API calls (the root listing is one of them).
+
+    Returns (blob entries, complete). Partial results are always merged in,
+    so detection never sees less than the truncated listing did. When the
+    budget runs out the tree stays marked truncated and every fail-open rule
+    still applies."""
+    blobs: dict[str, dict] = {e["path"]: e for e in partial
+                              if e.get("type") == "blob" and e.get("path")}
+    if max_fetches <= 0:
+        return list(blobs.values()), False
+    calls = 1
+    root, _ = _fetch_tree_raw(gh, org, repo, "HEAD", recursive=False)
+    queue: deque[tuple[str, str]] = deque()
+    for e in root:
+        if e.get("type") == "blob":
+            blobs[e["path"]] = e
+        elif e.get("type") == "tree" and e.get("sha"):
+            queue.append((e["path"], e["sha"]))
+    complete = True
+    while queue:
+        if calls >= max_fetches:
+            complete = False
+            break
+        prefix, sha = queue.popleft()
+        sub, truncated = _fetch_tree_raw(gh, org, repo, sha, recursive=True)
+        calls += 1
+        for e in sub:
+            if e.get("type") == "blob" and e.get("path"):
+                blobs[f"{prefix}/{e['path']}"] = dict(e, path=f"{prefix}/{e['path']}")
+        if truncated:
+            if calls >= max_fetches:
+                complete = False
+                break
+            level, _ = _fetch_tree_raw(gh, org, repo, sha, recursive=False)
+            calls += 1
+            for e in level:
+                full = f"{prefix}/{e.get('path', '')}"
+                if e.get("type") == "blob" and e.get("path"):
+                    blobs[full] = dict(e, path=full)
+                elif e.get("type") == "tree" and e.get("sha"):
+                    queue.append((full, e["sha"]))
+    log.info("[%s] truncated tree %s with %d subtree calls (%d files)", repo,
+             "completed" if complete else "partially completed (budget "
+             "exhausted, detection stays fail-open)", calls, len(blobs))
+    return sorted(blobs.values(), key=lambda e: e["path"]), complete
 
 
 def inspect_repo(gh: GhClient, org: str, repo: dict,
-                 prefetched_languages: dict[str, dict[str, int]] | None = None) -> RepoInfo:
+                 prefetched_languages: dict[str, dict[str, int]] | None = None,
+                 max_subtree_fetches: int = 0) -> RepoInfo:
     name = repo["name"]
     branch = repo.get("default_branch") or "main"
     info = RepoInfo(name=name, default_branch=branch)
@@ -990,16 +1300,23 @@ def inspect_repo(gh: GhClient, org: str, repo: dict,
     # HEAD always resolves the default branch regardless of branch naming
     # (slashes, unicode), unlike passing the branch name as a tree ref.
     entries, truncated = fetch_tree(gh, org, name, "HEAD", recursive=True)
-    info.tree_truncated = truncated
     if truncated:
-        # Recursive listing was cut off. Root-level files (where manifests and
-        # most IaC entry points live) may be missing, so merge in a guaranteed
-        # non-recursive root listing.
-        root_entries, _ = fetch_tree(gh, org, name, "HEAD", recursive=False)
-        seen = {e.get("path") for e in entries}
-        entries += [e for e in root_entries if e.get("path") not in seen]
-        log.warning("[%s] git tree truncated by API. Detection is best-effort; "
-                    "scans are kept ENABLED when in doubt.", name)
+        if max_subtree_fetches > 0:
+            entries, complete = complete_truncated_tree(
+                gh, org, name, entries, max_subtree_fetches)
+            truncated = not complete
+        else:
+            # Recursive listing was cut off. Root-level files (where
+            # manifests and most IaC entry points live) may be missing, so
+            # merge in a guaranteed non-recursive root listing.
+            root_entries, _ = fetch_tree(gh, org, name, "HEAD", recursive=False)
+            seen = {e.get("path") for e in entries}
+            entries += [e for e in root_entries if e.get("path") not in seen]
+        if truncated:
+            log.warning("[%s] git tree truncated by API. Detection is "
+                        "best-effort; scans are kept ENABLED when in doubt.",
+                        name)
+    info.tree_truncated = truncated
 
     info.paths = [e.get("path", "") for e in entries]
     info.sizes = {e.get("path", ""): e.get("size") for e in entries}
@@ -1267,7 +1584,10 @@ class Matrices:
         self.iac_file_names = {n.lower() for n in m["IAC_FILE_NAMES"]}
         self.iac_file_suffixes = tuple(s.lower() for s in m["IAC_FILE_SUFFIXES"])
         self.iac_name_prefixes = tuple(p.lower() for p in m["IAC_NAME_PREFIXES"])
-        self.iac_dir_hints = tuple(d.lower() for d in m["IAC_DIR_HINTS"])
+        # "/k8s/" style needles, matched against "/" + directory + "/".
+        self.iac_dir_hints = tuple(
+            "/" + d.strip("/").lower() + "/" for d in m["IAC_DIR_HINTS"]
+            if d.strip("/"))
         self.iac_languages = set(m["IAC_LANGUAGES"])
         self.windows_file_names = {n.lower() for n in m["WINDOWS_FILE_NAMES"]}
         self.windows_file_suffixes = tuple(s.lower() for s in m["WINDOWS_FILE_SUFFIXES"])
@@ -1303,13 +1623,23 @@ class Matrices:
 
 def framework_excluded_dirs(paths: list[str], mx: Matrices) -> tuple[str, ...]:
     """Lowercase "dir/" prefixes of framework platform folders to ignore.
-    Active only when the framework's marker file is at the repo root."""
-    root_files = {p.lower() for p in paths if "/" not in p}
-    out: list[str] = []
-    for marker, dirs in mx.framework_platform_dirs.items():
-        if marker in root_files:
-            out.extend(d + "/" for d in dirs if d)
-    return tuple(out)
+
+    Active wherever the framework's marker file sits: at the root it
+    excludes android/, ios/, ... and in a monorepo app directory it excludes
+    that app's siblings (apps/mobile/pubspec.yaml -> apps/mobile/android/).
+    Root-only matching let a nested Flutter app's Gradle wrapper enable Java
+    SCA and its Windows runner (C++/CMake) enable SAST. Markers inside
+    vendored paths are ignored so a committed dependency cannot hide code."""
+    out: set[str] = set()
+    for p in paths:
+        lp = p.lower()
+        parent, _, base = lp.rpartition("/")
+        dirs = mx.framework_platform_dirs.get(base)
+        if not dirs or not is_scannable_path(lp, mx):
+            continue
+        prefix = parent + "/" if parent else ""
+        out.update(prefix + d + "/" for d in dirs if d)
+    return tuple(sorted(out))
 
 
 def is_scannable_path(lower_path: str, mx: Matrices,
@@ -1568,7 +1898,8 @@ def decide(info: RepoInfo, mx: Matrices,
         if base in mx.iac_file_names or base.endswith(mx.iac_file_suffixes) \
                 or base.startswith(mx.iac_name_prefixes):
             iac_artifacts.add(base)
-        elif lp.startswith(mx.iac_dir_hints) and lp.endswith((".yml", ".yaml", ".json")):
+        elif lp.endswith((".yml", ".yaml", ".json")) and "/" in lp and any(
+                h in "/" + lp.rsplit("/", 1)[0] + "/" for h in mx.iac_dir_hints):
             iac_artifacts.add(lp)
     if all_langs & mx.iac_languages:
         iac_artifacts.add(f"languages:{sorted(all_langs & mx.iac_languages)}")
@@ -1576,7 +1907,8 @@ def decide(info: RepoInfo, mx: Matrices,
         iac_artifacts.update(deep_iac_hits)
     if iac_mode == "off":
         iac = False
-        iac_reason = "disabled org-wide via --iac off"
+        iac_reason = ("disabled org-wide via --iac off (secret scanning is "
+                      "part of this scan and is disabled too)")
     elif iac_mode == "artifacts":
         iac = bool(iac_artifacts) or info.tree_truncated
         if iac_artifacts:
@@ -1585,7 +1917,9 @@ def decide(info: RepoInfo, mx: Matrices,
             iac_reason = ("tree truncated, cannot prove absence of IaC "
                           "artifacts, kept enabled")
         else:
-            iac_reason = "no IaC/container artifacts detected (--iac artifacts)"
+            iac_reason = ("no IaC/container artifacts detected (--iac "
+                          "artifacts); secret scanning is part of this scan "
+                          "and is disabled too")
     else:
         # Default: ON everywhere. The scan also does secret detection on all
         # repo contents with low failure risk.
@@ -1696,7 +2030,8 @@ def decide(info: RepoInfo, mx: Matrices,
         "sca_ecosystems": sorted(eco_hits),
         "sca_ecosystem_languages": sorted(eco_languages),
         "paired_ecosystems": paired,
-        "iac_artifacts": sorted(iac_artifacts),
+        "iac_artifacts": sorted(iac_artifacts)[:EVIDENCE_CAP],
+        "iac_artifacts_total": len(iac_artifacts),
         "windows_strong": sorted(strong_hits),
         "windows_weak": sorted(weak_hits),
         "windows_corroborated": corroborated,
@@ -2028,8 +2363,13 @@ def search_open_scoping_prs(gh: GhClient, org: str, head: str) -> set[str] | Non
         log.warning("Stale-PR search failed, skipping cleanup of outdated "
                     "scoping PRs: %s", e.stderr.strip()[:150])
         return None
-    return {line.rstrip("/").rsplit("/", 1)[-1].lower()
-            for line in out.splitlines() if line.strip()}
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    if len(lines) >= 1000:
+        # The search API returns at most 1000 results per query.
+        log.warning("[%s] stale-PR search hit the 1000-result search cap; "
+                    "some outdated scoping PRs may not be reconciled this run",
+                    org)
+    return {ln.rstrip("/").rsplit("/", 1)[-1].lower() for ln in lines}
 
 
 # ---------------------------------------------------------------------------
@@ -2075,7 +2415,14 @@ def write_csv_report(path: str, report: list[dict]) -> None:
         "iac", "iac_reason",
         "runner", "runner_reason",
         "languages", "pr_url", "error", "carried_over",
+        # Appended after the original columns so positional consumers of
+        # earlier CSVs keep working.
+        "error_category",
     ]
+    _atomic_write_text(path, lambda tmp: _write_csv_rows(tmp, fieldnames, report))
+
+
+def _write_csv_rows(path: str, fieldnames: list[str], report: list[dict]) -> None:
     # utf-8-sig: Excel only detects UTF-8 with a BOM, and the locale default
     # (cp1252 on Windows) crashes on non-ASCII file names in reasons.
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
@@ -2105,6 +2452,7 @@ def write_csv_report(path: str, report: list[dict]) -> None:
                 "pr_url": r.get("pr_url", ""),
                 "error": r.get("error", ""),
                 "carried_over": r.get("carried_over", False),
+                "error_category": r.get("error_category", ""),
             }
             writer.writerow({k: _csv_cell(v) for k, v in row.items()})
 
@@ -2132,7 +2480,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Print decisions and generated YAML, change nothing")
     ap.add_argument("--direct-commit", action="store_true",
                     help="Commit to the default branch instead of opening a PR")
-    ap.add_argument("--branch-name", default="chore/veracode-scan-scoping")
+    ap.add_argument("--branch-name", default="chore/veracode-scan-scoping",
+                    help="Branch used for scoping PRs (validated as a git "
+                         "branch name)")
     ap.add_argument("--include", nargs="+", default=["*"],
                     help="Glob patterns of repos to include")
     ap.add_argument("--exclude", nargs="*", default=["veracode"],
@@ -2173,8 +2523,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="auto (default): set a Windows runner when Windows "
                          "build signals are confirmed and a build-based scan is "
                          "enabled. Weak signals (xaml, web.config, "
-                         "vbproj/fsproj) automatically trigger project-file "
-                         "inspection. off: never write a runner.")
+                         "app.config, AssemblyInfo, vbproj/fsproj) "
+                         "automatically trigger project-file inspection. "
+                         "off: never write a runner.")
     ap.add_argument("--runner-scope", choices=["build", "all"], default="build",
                     help="build (default): write actions: <scan>: build: runs_on "
                          "for the enabled SAST/SCA scans only. all: write "
@@ -2207,6 +2558,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--no-graphql", action="store_true",
                     help="Disable batched GraphQL language prefetching and "
                          "use one REST call per repo instead")
+    ap.add_argument("--max-subtree-fetches", type=int, default=25,
+                    help="When GitHub truncates a repo's recursive tree "
+                         "(over 100,000 entries / 7 MB), rebuild it from "
+                         "per-directory subtree listings using up to N extra "
+                         "API calls (default 25). If the budget runs out the "
+                         "repo keeps fail-open handling. 0 disables.")
     ap.add_argument("--max-project-files", type=int, default=5,
                     help="Max .NET project files downloaded per repo during "
                          "Windows-marker inspection (default 5). Raise for "
@@ -2237,10 +2594,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                 excludes: list[str], iac_mode: str,
                 resume_done: set[tuple[str, str]], report: list[dict],
-                summary: dict) -> None:
+                summary: dict, on_repo_done=None) -> None:
     """Filter, inspect, decide and deliver for every repo of one org.
     Per-repo failures are recorded and never stop the org or the run.
-    KeyboardInterrupt propagates so the caller can flush reports."""
+    KeyboardInterrupt and GhAuthError propagate so the caller can flush
+    reports and stop. on_repo_done() is called after every repo (used for
+    report checkpoints)."""
     def label(name: str) -> str:
         return f"{org}/{name}"
 
@@ -2258,8 +2617,9 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
             summary["skipped"].append((label(name), "fork")); continue
         if repo.get("disabled"):
             summary["skipped"].append((label(name), "disabled")); continue
-        if repo.get("size") == 0:
-            summary["skipped"].append((label(name), "empty")); continue
+        # size == 0 is NOT used as an emptiness test: GitHub computes size
+        # hourly and reports 0 for freshly pushed repos. Emptiness comes
+        # from GraphQL isEmpty below, or from the tree API's 409.
         if (org.lower(), name.lower()) in resume_done:
             summary["skipped"].append((label(name),
                                        "already processed (--resume-from)"))
@@ -2270,28 +2630,36 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
 
     prefetched_languages: dict[str, dict[str, int]] = {}
     prefetched_blobs: dict[str, tuple[str, str]] = {}
+    empty_repos: set[str] = set()
     if todo and not args.no_graphql:
         prefetched_languages = batch_fetch_languages(
-            gh, org, [r["name"] for r in todo], blobs=prefetched_blobs)
+            gh, org, [r["name"] for r in todo], blobs=prefetched_blobs,
+            empties=empty_repos)
         log.info("[%s] Prefetched languages for %d/%d repos via GraphQL "
                  "(any missing fall back to per-repo REST)", org,
                  len(prefetched_languages), len(todo))
+        if empty_repos:
+            for repo in todo:
+                if repo["name"] in empty_repos:
+                    summary["skipped"].append((label(repo["name"]), "empty"))
+            todo = [r for r in todo if r["name"] not in empty_repos]
 
     # Open scoping PRs that a fresh scan no longer justifies (the repo
-    # gained code while the PR sat unmerged, or the default branch already
-    # has the right settings) are closed, so a stale proposal cannot be
-    # merged later. PR mode only.
+    # gained code while the PR sat unmerged, the default branch already has
+    # the right settings, or --direct-commit just wrote them) are closed,
+    # so a stale proposal cannot be merged later.
     stale_pr_repos: set[str] | None = set()
-    if todo and not args.direct_commit:
+    if todo:
         stale_pr_repos = search_open_scoping_prs(gh, org, args.branch_name)
 
     for idx, repo in enumerate(todo, 1):
         name = repo["name"]
         log.info("[%s %d/%d] %s", org, idx, len(todo), name)
         report_entry: dict | None = None
-
+        calls_before = gh.api_calls
         try:
-            info = inspect_repo(gh, org, repo, prefetched_languages)
+            info = inspect_repo(gh, org, repo, prefetched_languages,
+                                max_subtree_fetches=args.max_subtree_fetches)
             if not info.paths and not info.languages:
                 summary["skipped"].append((label(name), "no readable content"))
                 continue
@@ -2345,8 +2713,20 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
             log.info("[%s/%s] SAST=%s SCA=%s IaC=%s runner=%s", org, name,
                      decision.sast, decision.sca, decision.iac,
                      decision.runner or "default")
+            # Why a scan is off, or why Windows was chosen, is what an
+            # administrator reviews first: INFO. Reasons for enabled scans
+            # stay at DEBUG (-v) to keep large runs readable.
             for k in SECTION_KEYS:
-                log.debug("[%s/%s]   %s: %s", org, name, k, decision.reasons[k])
+                level = logging.DEBUG if getattr(decision, k) else logging.INFO
+                log.log(level, "[%s/%s] %s %s: %s", org, name, k.upper(),
+                        "on" if getattr(decision, k) else "off",
+                        decision.reasons[k])
+            if decision.runner:
+                log.info("[%s/%s] Windows runner %s: %s", org, name,
+                         decision.runner, decision.reasons.get("runner", ""))
+            else:
+                log.debug("[%s/%s] runner: %s", org, name,
+                          decision.reasons.get("runner", ""))
 
             report_entry = {"org": org, "repo": name,
                             "default_branch": info.default_branch,
@@ -2453,6 +2833,12 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
                 summary["scoped"].append((label(name), f"committed ({action}) "
                                                        f"to {info.default_branch}"))
                 report_entry["outcome"] = "committed"
+                # An open scoping PR from an earlier PR-mode run is now
+                # redundant: the default branch carries the settings.
+                reconcile_open_pr(gh, org, name, args, stale_pr_repos,
+                                  report_entry,
+                                  "no_override" if action == "delete"
+                                  else "already_correct")
                 continue
 
             open_url = find_pr(gh, org, name, args.branch_name, open_only=True)
@@ -2487,40 +2873,204 @@ def process_org(gh: GhClient, org: str, repos: list[dict], args, mx: Matrices,
             report_entry["outcome"] = "pr_opened"
             report_entry["pr_url"] = url
             report_entry["pr_reused"] = bool(open_url)
+        except GhAuthError as e:
+            _mark_failed(report, report_entry, org, name, str(e)[:500], "auth")
+            summary["failed"].append((label(name), "authentication failed"))
+            raise
         except GhError as e:
-            log.error("[%s/%s] %s", org, name, e)
-            summary["failed"].append((label(name), str(e)[:200]))
-            _mark_failed(report, report_entry, org, name, str(e)[:500])
+            cat = classify_error(e)
+            log.error("[%s/%s] failed (%s): %s", org, name, cat, e)
+            summary["failed"].append((label(name), f"[{cat}] {str(e)[:200]}"))
+            _mark_failed(report, report_entry, org, name, str(e)[:500], cat)
         except Exception as e:  # never let one repo kill an org-wide run
             log.exception("[%s/%s] unexpected error", org, name)
-            summary["failed"].append((label(name), f"{type(e).__name__}: {e}"))
+            cat = classify_error(e)
+            summary["failed"].append((label(name), f"[{cat}] "
+                                      f"{type(e).__name__}: {e}"))
             _mark_failed(report, report_entry, org, name,
-                         f"{type(e).__name__}: {e}")
+                         f"{type(e).__name__}: {e}", cat)
+        finally:
+            entry = report_entry if report_entry is not None else (
+                report[-1] if report and report[-1].get("repo") == name
+                and report[-1].get("org") == org else None)
+            if entry is not None:
+                entry["api_calls"] = gh.api_calls - calls_before
+            if on_repo_done is not None:
+                on_repo_done()
+
+
+CHECKPOINT_EVERY = 25      # repos between report checkpoints
+CHECKPOINT_SECONDS = 300   # ... or this many seconds, whichever is first
+SUMMARY_LIST_LIMIT = 25    # per-category lines printed without --verbose
+
+
+def _atomic_write_text(path: str, write) -> None:
+    """Write via a temp file and os.replace, so a crash or kill mid-write
+    never leaves a truncated report that --resume-from cannot parse."""
+    tmp = f"{path}.tmp"
+    try:
+        write(tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _skip_group(reason: str) -> str:
+    """Stable grouping key for skip reasons that embed URLs or names."""
+    return reason.split(":", 1)[0].split(" (", 1)[0].strip()
+
+
+def print_summary(summary: dict, orgs: list[str], org_errors: list[dict],
+                  gh: GhClient, elapsed: float, repos_seen: int,
+                  verbose: bool) -> None:
+    """Counts first, then only the lines an administrator acts on. Large
+    runs list at most SUMMARY_LIST_LIMIT entries per category (everything
+    is in the JSON/CSV reports); --verbose lists all."""
+    limit = None if verbose else SUMMARY_LIST_LIMIT
+
+    def listing(items: list) -> None:
+        shown = items if limit is None else items[:limit]
+        for it in shown:
+            print(f"  {it[0]}: {it[1]}" if isinstance(it, tuple) else f"  {it}")
+        if len(items) > len(shown):
+            print(f"  ... {len(items) - len(shown)} more (see --report/--csv)")
+
+    print("\n========== SUMMARY ==========")
+    print(f"Orgs: {len(orgs)} ({len(org_errors)} not accessible)")
+    print(f"Scoped (override written/PR): {len(summary['scoped'])}")
+    listing(summary["scoped"])
+    print(f"No change needed: {len(summary['no_change'])}")
+    if verbose:
+        listing(summary["no_change"])
+    print(f"Already correct (identical settings): "
+          f"{len(summary['unchanged_identical'])}")
+    if verbose:
+        listing(summary["unchanged_identical"])
+    print(f"Skipped: {len(summary['skipped'])}")
+    if verbose:
+        listing(summary["skipped"])
+    else:
+        groups: dict[str, int] = {}
+        for _, why in summary["skipped"]:
+            groups[_skip_group(why)] = groups.get(_skip_group(why), 0) + 1
+        for why, n in sorted(groups.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  {why}: {n}")
+    print(f"Failed: {len(summary['failed'])}")
+    listing(summary["failed"])
+    per_repo = (gh.api_calls / repos_seen) if repos_seen else 0.0
+    print(f"GitHub API calls: {gh.api_calls} ({gh.write_calls} writes, "
+          f"{gh.retries} retries, {gh.wait_seconds:.0f}s rate-limit/backoff "
+          f"waits); {per_repo:.1f} calls per processed repo; elapsed "
+          f"{elapsed / 60:.1f} min")
+
+
+def _validate_args(args) -> str | None:
+    """Return an error message for invalid arguments, else None. Runs before
+    any gh call, so bad input never reaches the GitHub API."""
+    if not (args.org or args.orgs_file or args.enterprise):
+        return "No target orgs: pass --org, --orgs-file and/or --enterprise"
+    if args.no_iac and args.iac not in ("always", "off"):
+        return f"--no-iac conflicts with --iac {args.iac}"
+    if not RUNNER_LABEL_RE.match(args.windows_runner):
+        return (f"--windows-runner {args.windows_runner!r} is not a valid "
+                f"runner label or flow list")
+    if not valid_branch_name(args.branch_name):
+        return (f"--branch-name {args.branch_name!r} is not a valid git branch "
+                f"name")
+    if args.max_project_files < 1 or args.gh_timeout <= 0:
+        return "--max-project-files must be >= 1 and --gh-timeout > 0"
+    for flag in ("min_interval", "write_interval", "min_remaining",
+                 "max_writes_per_hour", "max_subtree_fetches"):
+        if getattr(args, flag) < 0:
+            return f"--{flag.replace('_', '-')} must be >= 0"
+    if args.enterprise and not valid_login(args.enterprise):
+        return f"--enterprise {args.enterprise!r} is not a valid enterprise slug"
+    explicit = list(args.org or [])
+    if args.orgs_file:
+        try:
+            from_file = read_orgs_file(args.orgs_file)
+        except (OSError, UnicodeDecodeError) as e:
+            return f"Cannot read --orgs-file {args.orgs_file}: {e}"
+        if not from_file:
+            return f"--orgs-file {args.orgs_file} has no org names"
+        explicit += from_file
+    bad = [o for o in explicit if not valid_login(o)]
+    if bad:
+        return ("Invalid organization login(s): "
+                + ", ".join(repr(sanitize(o)) for o in bad[:5]))
+    return None
+
+
+def _load_resume(path: str) -> tuple[set[tuple[str, str]], list[dict]]:
+    """Resume state is keyed by (org, repo), case-insensitive. Reports from
+    the single-org version carry the org only at the top level; that value
+    is used for their entries."""
+    resume_done: set[tuple[str, str]] = set()
+    carried: list[dict] = []
+    with open(path, encoding="utf-8") as f:
+        prior = json.load(f)
+    prior_org = prior.get("org")
+    for r in prior.get("repos", []):
+        if not (isinstance(r, dict) and r.get("repo")
+                and r.get("outcome") in TERMINAL_OUTCOMES):
+            continue
+        org_of = r.get("org") or prior_org
+        if not isinstance(org_of, str) or not org_of:
+            continue
+        key = (org_of.lower(), str(r["repo"]).lower())
+        if key in resume_done:
+            continue
+        resume_done.add(key)
+        carried.append(dict(r, org=org_of, carried_over=True))
+    return resume_done, carried
+
+
+def _check_auth(gh: GhClient, token_source: str) -> bool:
+    """`gh auth status` exits non-zero when ANY configured host or account
+    has a problem (a stale second account, an unreachable GHES host), even
+    though the active credentials work. On failure, probe the API itself
+    (/rate_limit is free and works for PATs and app tokens) before giving
+    up."""
+    try:
+        gh.run(["auth", "status"], max_retries=1)
+        log.info("Authenticated via %s", token_source)
+        return True
+    except FileNotFoundError:
+        log.error("GitHub CLI 'gh' was not found on PATH")
+        return False
+    except GhError as e:
+        first = (e.stderr.strip().splitlines() or [""])[0][:200]
+        try:
+            gh.run(["api", "rate_limit"], max_retries=2)
+        except GhError as e2:
+            log.error("gh CLI not authenticated (%s): %s", token_source,
+                      e2.stderr.strip()[:300] or first)
+            return False
+        log.warning("`gh auth status` reported a problem (%s) but the API "
+                    "accepts the active credentials (%s); continuing.",
+                    sanitize(first), token_source)
+        return True
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
+    started = time.monotonic()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(levelname)s %(message)s")
 
-    if not (args.org or args.orgs_file or args.enterprise):
-        log.error("No target orgs: pass --org, --orgs-file and/or --enterprise")
+    problem = _validate_args(args)
+    if problem:
+        log.error("%s", problem)
         return 2
     iac_mode = "off" if args.no_iac else args.iac
-    if args.no_iac and args.iac not in ("always", "off"):
-        log.error("--no-iac conflicts with --iac %s", args.iac)
-        return 2
     if args.deep_iac and iac_mode != "artifacts":
         log.warning("--deep-iac only affects --iac artifacts; ignoring it "
                     "(no extra API calls will be made).")
-    if not RUNNER_LABEL_RE.match(args.windows_runner):
-        log.error("--windows-runner %r is not a valid runner label or flow list",
-                  args.windows_runner)
-        return 2
-    if args.max_project_files < 1 or args.gh_timeout <= 0:
-        log.error("--max-project-files must be >= 1 and --gh-timeout > 0")
-        return 2
 
     overrides = None
     if args.config:
@@ -2546,28 +3096,11 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Added central '%s' repo to excludes automatically.",
                  args.central_repo)
 
-    # Resume state is keyed by (org, repo), case-insensitive. Reports from
-    # the single-org version carry the org only at the top level; that value
-    # is used for their entries.
     resume_done: set[tuple[str, str]] = set()
     carried: list[dict] = []
     if args.resume_from:
         try:
-            with open(args.resume_from, encoding="utf-8") as f:
-                prior = json.load(f)
-            prior_org = prior.get("org")
-            for r in prior.get("repos", []):
-                if not (isinstance(r, dict) and r.get("repo")
-                        and r.get("outcome") in TERMINAL_OUTCOMES):
-                    continue
-                org_of = r.get("org") or prior_org
-                if not isinstance(org_of, str) or not org_of:
-                    continue
-                key = (org_of.lower(), str(r["repo"]).lower())
-                if key in resume_done:
-                    continue
-                resume_done.add(key)
-                carried.append(dict(r, org=org_of, carried_over=True))
+            resume_done, carried = _load_resume(args.resume_from)
             log.info("Resume: %d repos with terminal outcomes in %s will be "
                      "skipped and carried into the new report",
                      len(resume_done), args.resume_from)
@@ -2575,9 +3108,12 @@ def main(argv: list[str] | None = None) -> int:
             log.error("Cannot read --resume-from %s: %s", args.resume_from, e)
             return 2
 
+    # Dry runs get a read-only client: any write attempt raises before it
+    # is sent, independent of the per-call dry-run checks below.
     gh = GhClient(min_interval=args.min_interval, min_remaining=args.min_remaining,
                   timeout=args.gh_timeout, write_interval=args.write_interval,
-                  writes_per_hour=args.max_writes_per_hour)
+                  writes_per_hour=args.max_writes_per_hour,
+                  read_only=args.dry_run)
     # Authentication is whatever gh resolves: GH_TOKEN, then GITHUB_TOKEN,
     # then stored `gh auth login` credentials (GH_ENTERPRISE_TOKEN/GH_HOST
     # for GHES). Checking one env var here gave false assurance when
@@ -2586,13 +3122,8 @@ def main(argv: list[str] | None = None) -> int:
     token_source = ("GH_TOKEN" if os.environ.get("GH_TOKEN") else
                     "GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN") else
                     "gh stored credentials")
-    try:
-        gh.run(["auth", "status"])
-    except (GhError, FileNotFoundError) as e:
-        log.error("gh CLI not available or not authenticated (%s): %s",
-                  token_source, e)
+    if not _check_auth(gh, token_source):
         return 2
-    log.info("Authenticated via %s", token_source)
 
     try:
         orgs = resolve_orgs(gh, args)
@@ -2610,93 +3141,135 @@ def main(argv: list[str] | None = None) -> int:
     report: list[dict] = list(carried)
     org_errors: list[dict] = []
     interrupted = False
+    aborted: str | None = None
+    progress = {"repos": 0, "since_flush": 0, "last_flush": time.monotonic()}
 
-    def flush_reports() -> None:
-        """Write JSON/CSV reports. Called from a finally block so an
-        interrupted or crashed run still leaves its evidence behind instead
-        of losing hours of API work."""
+    def flush_reports(final: bool = True) -> None:
+        """Write JSON/CSV reports atomically. Called periodically as a
+        checkpoint and from a finally block, so an interrupted, killed or
+        crashed run still leaves its evidence behind for --resume-from."""
+        progress["since_flush"] = 0
+        progress["last_flush"] = time.monotonic()
+        level = logging.INFO if final else logging.DEBUG
         if args.report:
+            doc = {"org": orgs[0] if len(orgs) == 1 else None,
+                   "orgs": orgs,
+                   "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                   "api_calls": gh.api_calls,
+                   "write_calls": gh.write_calls,
+                   "interrupted": interrupted,
+                   "aborted": aborted,
+                   "complete": final and not interrupted and not aborted,
+                   "stats": {"elapsed_seconds": round(time.monotonic() - started, 1),
+                             "repos_processed": progress["repos"],
+                             "retries": gh.retries,
+                             "rate_limit_wait_seconds": round(gh.wait_seconds, 1)},
+                   "org_errors": org_errors,
+                   "repos": report}
+
+            def write_json(tmp: str) -> None:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(doc, f, indent=2)
             try:
-                with open(args.report, "w", encoding="utf-8") as f:
-                    json.dump({"org": orgs[0] if len(orgs) == 1 else None,
-                               "orgs": orgs,
-                               "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                          time.gmtime()),
-                               "api_calls": gh.api_calls,
-                               "write_calls": gh.write_calls,
-                               "interrupted": interrupted,
-                               "org_errors": org_errors,
-                               "repos": report}, f, indent=2)
-                log.info("Audit report written to %s", args.report)
+                _atomic_write_text(args.report, write_json)
+                log.log(level, "Audit report written to %s", args.report)
             except OSError as e:
                 log.error("Failed writing --report %s: %s", args.report, e)
         csv_path = args.csv or ("dry_run_report.csv" if args.dry_run else None)
         if csv_path:
             try:
                 write_csv_report(csv_path, report)
-                log.info("CSV report written to %s", csv_path)
+                log.log(level, "CSV report written to %s", csv_path)
             except OSError as e:
                 log.error("Failed writing CSV %s: %s", csv_path, e)
+
+    def on_repo_done() -> None:
+        progress["repos"] += 1
+        progress["since_flush"] += 1
+        if progress["since_flush"] >= CHECKPOINT_EVERY or \
+                time.monotonic() - progress["last_flush"] >= CHECKPOINT_SECONDS:
+            flush_reports(final=False)
 
     def org_failed(org: str, what: str, e: GhError) -> None:
         err = e.stderr.strip()[:300]
         log.error("[%s] %s, skipping this org (check the org name, token "
                   "scopes repo + read:org, and SAML SSO authorization for "
                   "this org): %s", org, what, err)
-        org_errors.append({"org": org, "error": f"{what}: {err}"})
+        org_errors.append({"org": org, "error": f"{what}: {err}",
+                           "error_category": classify_error(e)})
         summary["failed"].append((org, f"{what}: {err[:150]}"))
+
+    # SIGTERM (CI cancellation, `kill`, container stop) is handled like
+    # Ctrl-C so the finally block below still writes the reports.
+    def on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+    prev_sigterm = None
+    try:
+        prev_sigterm = signal.signal(signal.SIGTERM, on_sigterm)
+    except (ValueError, OSError, AttributeError):  # not main thread / platform
+        prev_sigterm = None
 
     try:
         for oidx, org in enumerate(orgs, 1):
             log.info("========== Org %d/%d: %s ==========", oidx, len(orgs), org)
             try:
                 gh.run(["api", f"orgs/{org}", "--jq", ".login"])
+            except GhAuthError:
+                raise
             except GhError as e:
                 org_failed(org, "cannot access org", e)
                 continue
             try:
                 repos = list_org_repos(gh, org)
+            except GhAuthError:
+                raise
             except GhError as e:
                 org_failed(org, "cannot list repos", e)
                 continue
             process_org(gh, org, repos, args, mx, excludes, iac_mode,
-                        resume_done, report, summary)
+                        resume_done, report, summary, on_repo_done)
     except KeyboardInterrupt:
         interrupted = True
-        log.warning("Interrupted (Ctrl-C). Writing partial reports for the "
-                    "%d repos processed so far before exiting.", len(report))
+        log.warning("Interrupted. Writing partial reports for the %d repos "
+                    "processed so far before exiting; rerun with "
+                    "--resume-from to continue.", len(report))
+    except GhAuthError as e:
+        aborted = "authentication"
+        log.error("Authentication failed (token expired, revoked, or missing): "
+                  "%s. Stopping the run: every remaining call would fail the "
+                  "same way. Completed repos are in the report; rerun with "
+                  "--resume-from after fixing the credentials.",
+                  e.stderr.strip()[:200])
     finally:
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
         flush_reports()
 
-    print("\n========== SUMMARY ==========")
-    print(f"Orgs: {len(orgs)} ({len(org_errors)} not accessible)")
-    for key, label in (("scoped", "Scoped (override written/PR)"),
-                       ("no_change", "No change needed"),
-                       ("unchanged_identical", "Already correct (identical settings)"),
-                       ("skipped", "Skipped"),
-                       ("failed", "Failed")):
-        items = summary[key]
-        print(f"{label}: {len(items)}")
-        for it in items:
-            print(f"  {it[0]}: {it[1]}" if isinstance(it, tuple) else f"  {it}")
-    print(f"Total GitHub API calls: {gh.api_calls} ({gh.write_calls} writes)")
+    print_summary(summary, orgs, org_errors, gh, time.monotonic() - started,
+                  progress["repos"], args.verbose)
     # Exit codes match the sibling bulk tools: 0 ok, 2 any repo or org
-    # failed (or nothing could run), 130 interrupted.
+    # failed, authentication lost, or nothing could run; 130 interrupted.
     if interrupted:
         return 130
-    return 2 if summary["failed"] or org_errors else 0
+    return 2 if summary["failed"] or org_errors or aborted else 0
 
 
 def _mark_failed(report: list[dict], entry: dict | None, org: str, name: str,
-                 error: str) -> None:
+                 error: str, category: str = "unknown") -> None:
     """Record a failure in the report. Failures before a decision was made
-    previously left no trace in the JSON/CSV at all."""
+    previously left no trace in the JSON/CSV at all. error_category groups
+    failures into actionable classes (auth, permission, protected_branch,
+    conflict, rate_limit, timeout, transient, ...)."""
     if entry is None:
         report.append({"org": org, "repo": name, "outcome": "failed",
-                       "error": error})
+                       "error": error, "error_category": category})
     else:
         entry["outcome"] = "failed"
         entry["error"] = error
+        entry["error_category"] = category
 
 
 if __name__ == "__main__":
